@@ -9,12 +9,78 @@ from bot.keyboards import kb_cart_actions, kb_back_to_menu
 from bot.utils import format_cart, parse_quantity
 from bot.filters import StateFilter
 from telegram import InputMediaPhoto, InputMediaVideo
+from bot.utils import escape_markdown
+
 
 logger = logging.getLogger(__name__)
 ITEMS_PER_PAGE = 3
 
 _catalog_messages: dict[int, list[str]] = {}
 
+
+async def search_article_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('state') != 'search_article':
+        return
+    message = update.message
+    article_input = message.text.strip()
+    if not article_input:
+        await message.reply_text("❌ Введите артикул.", reply_markup=kb_back_to_menu())
+        return
+    async for session in get_session():
+        product = (await session.execute(
+            select(Product).where(Product.is_active == True, Product.article == article_input)
+        )).scalar_one_or_none()
+        break
+    if not product:
+        await message.reply_text("🔎 Товар с таким артикулом не найден.", reply_markup=kb_back_to_menu())
+        context.user_data.pop('state', None)
+        return
+
+    name = escape_markdown(product.name)
+    article = escape_markdown(product.article) if product.article else None
+    text = name
+    if article:
+        text += f"\nАртикул {article}"
+    if product.stock is not None:
+        text += f"\nНа складе: {product.stock}"
+    text += f"\n\nЦена {product.price:.0f} ₽"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 Заказать", callback_data=f"order:start:{product.id}")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
+    ])
+
+    photos = product.photo_file_ids.split(',') if product.photo_file_ids else []
+    videos = product.video_file_ids.split(',') if product.video_file_ids else []
+
+    try:
+        if len(photos) == 1 and not videos:
+            await message.reply_photo(photo=photos[0], caption=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        elif len(videos) == 1 and not photos:
+            await message.reply_video(video=videos[0], caption=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        elif photos or videos:
+            media = []
+            for idx, fid in enumerate(photos):
+                if idx == 0 and not videos:
+                    media.append(InputMediaPhoto(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
+                else:
+                    media.append(InputMediaPhoto(media=fid))
+            for idx, fid in enumerate(videos):
+                if idx == 0 and not photos:
+                    media.append(InputMediaVideo(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
+                else:
+                    media.append(InputMediaVideo(media=fid))
+            if photos and videos:
+                media[0] = InputMediaPhoto(media=photos[0], caption=text, parse_mode=ParseMode.MARKDOWN)
+
+            msgs = await message.reply_media_group(media=media)
+            await message.reply_text("Выберите действие:", reply_markup=kb)
+        else:
+            await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.warning(f"Ошибка при отправке медиа для артикула {article_input}: {e}")
+        await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
+    context.user_data.pop('state', None)
 
 async def delete_catalog_messages(user_id: int, bot, also_delete_message_id: str | None = None):
     """Удаляет все сохранённые сообщения каталога для пользователя."""
@@ -27,6 +93,11 @@ async def delete_catalog_messages(user_id: int, bot, also_delete_message_id: str
         except Exception:
             pass
 
+async def search_article_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['state'] = 'search_article'
+    await query.edit_message_text("🔎 Введите артикул:", reply_markup=kb_back_to_menu())
 
 async def show_category_page(query, context, category: str, page: int):
     async for session in get_session():
@@ -38,10 +109,8 @@ async def show_category_page(query, context, category: str, page: int):
             .order_by(Product.id).offset(page * ITEMS_PER_PAGE).limit(ITEMS_PER_PAGE)
         )).scalars().all()
     if not products:
-        await query.edit_message_text(
-            f"В категории «{category}» пока нет товаров.",
-            reply_markup=kb_back_to_menu()
-        )
+        await query.edit_message_text(f"В категории «{category}» пока нет товаров.",
+                                       reply_markup=kb_back_to_menu())
         return
 
     new_msgs = []
@@ -49,9 +118,11 @@ async def show_category_page(query, context, category: str, page: int):
     bot = context.bot
 
     for product in products:
-        text = product.name
-        if product.article:
-            text += f"\nАртикул {product.article}"
+        name = escape_markdown(product.name)
+        article = escape_markdown(product.article) if product.article else None
+        text = name
+        if article:
+            text += f"\nАртикул {article}"
         if product.stock is not None:
             text += f"\nНа складе: {product.stock}"
         text += f"\n\nЦена {product.price:.0f} ₽"
@@ -60,59 +131,43 @@ async def show_category_page(query, context, category: str, page: int):
         photos = product.photo_file_ids.split(',') if product.photo_file_ids else []
         videos = product.video_file_ids.split(',') if product.video_file_ids else []
 
-        # Одно фото без видео
-        if len(photos) == 1 and not videos:
-            msg = await bot.send_photo(
-                chat_id=chat_id,
-                photo=photos[0],
-                caption=text,
-                reply_markup=kb,
-                parse_mode=ParseMode.MARKDOWN
-            )
-            new_msgs.append(msg.message_id)
-            continue
-        # Одно видео без фото
-        if len(videos) == 1 and not photos:
-            msg = await bot.send_video(
-                chat_id=chat_id,
-                video=videos[0],
-                caption=text,
-                reply_markup=kb,
-                parse_mode=ParseMode.MARKDOWN
-            )
-            new_msgs.append(msg.message_id)
-            continue
+        # Пытаемся отправить фото/видео с прикреплённой кнопкой
+        try:
+            if len(photos) == 1 and not videos:
+                msg = await bot.send_photo(chat_id=chat_id, photo=photos[0], caption=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+                new_msgs.append(msg.message_id)
+            elif len(videos) == 1 and not photos:
+                msg = await bot.send_video(chat_id=chat_id, video=videos[0], caption=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+                new_msgs.append(msg.message_id)
+            elif photos or videos:
+                media = []
+                for idx, fid in enumerate(photos):
+                    if idx == 0 and not videos:
+                        media.append(InputMediaPhoto(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
+                    else:
+                        media.append(InputMediaPhoto(media=fid))
+                for idx, fid in enumerate(videos):
+                    if idx == 0 and not photos:
+                        media.append(InputMediaVideo(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
+                    else:
+                        media.append(InputMediaVideo(media=fid))
+                if photos and videos:
+                    media[0] = InputMediaPhoto(media=photos[0], caption=text, parse_mode=ParseMode.MARKDOWN)
 
-        # Несколько медиа – формируем группу
-        media = []
-        # Сначала добавляем все фото, первое с caption
-        for idx, fid in enumerate(photos):
-            if idx == 0 and not videos:
-                # первое фото и нет видео – оно будет с caption
-                media.append(InputMediaPhoto(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
+                msgs = await bot.send_media_group(chat_id=chat_id, media=media)
+                for m in msgs:
+                    new_msgs.append(m.message_id)
+                # Кнопку добавляем отдельным сообщением, но уже без дублирования текста
+                btn_msg = await bot.send_message(chat_id=chat_id, text="Выберите действие:", reply_markup=kb)
+                new_msgs.append(btn_msg.message_id)
             else:
-                media.append(InputMediaPhoto(media=fid))
-        # Добавляем видео, если первое медиа — видео (без фото)
-        for idx, fid in enumerate(videos):
-            if idx == 0 and not photos:
-                media.append(InputMediaVideo(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
-            else:
-                media.append(InputMediaVideo(media=fid))
-        # Если есть и фото и видео, caption должен быть на первом фото, исправляем:
-        if photos and videos:
-            # уже первое фото без caption, заменим его
-            media[0] = InputMediaPhoto(media=photos[0], caption=text, parse_mode=ParseMode.MARKDOWN)
-
-        msgs = await bot.send_media_group(chat_id=chat_id, media=media)
-        for m in msgs:
-            new_msgs.append(m.message_id)
-        # Добавляем сообщение с кнопкой после медиагруппы
-        btn_msg = await bot.send_message(
-            chat_id=chat_id,
-            text="Выберите действие:",
-            reply_markup=kb
-        )
-        new_msgs.append(btn_msg.message_id)
+                msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+                new_msgs.append(msg.message_id)
+        except Exception as e:
+            logger.warning(f"Ошибка отправки медиа для товара {product.id}: {e}")
+            # При ошибке отправляем просто текст с кнопкой
+            msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            new_msgs.append(msg.message_id)
 
     # Навигационное сообщение
     total_pages = (total - 1) // ITEMS_PER_PAGE + 1
@@ -257,9 +312,11 @@ async def start_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.message.delete()
 
-    text = product.name
-    if product.article:
-        text += f"\nАртикул {product.article}"
+    name = escape_markdown(product.name)
+    article = escape_markdown(product.article) if product.article else None
+    text = name
+    if article:
+        text += f"\nАртикул {article}"
     if product.stock is not None:
         text += f"\nНа складе: {product.stock}"
     text += f"\n\nЦена {product.price:.0f} ₽\n\n✏️ Введите количество:"
@@ -268,109 +325,42 @@ async def start_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     videos = product.video_file_ids.split(',') if product.video_file_ids else []
 
     card_msg_id = None
-    if len(photos) == 1 and not videos:
-        msg = await query.message.reply_photo(
-            photo=photos[0],
-            caption=text,
-            reply_markup=kb_back_to_menu(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        card_msg_id = msg.message_id
-    elif len(videos) == 1 and not photos:
-        msg = await query.message.reply_video(
-            video=videos[0],
-            caption=text,
-            reply_markup=kb_back_to_menu(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        card_msg_id = msg.message_id
-    elif photos or videos:
-        media = []
-        for idx, fid in enumerate(photos):
-            if idx == 0 and not videos:
-                media.append(InputMediaPhoto(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
-            else:
-                media.append(InputMediaPhoto(media=fid))
-        for idx, fid in enumerate(videos):
-            if idx == 0 and not photos:
-                media.append(InputMediaVideo(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
-            else:
-                media.append(InputMediaVideo(media=fid))
-        if photos and videos:
-            media[0] = InputMediaPhoto(media=photos[0], caption=text, parse_mode=ParseMode.MARKDOWN)
-        msgs = await query.message.reply_media_group(media=media)
-        # Добавляем кнопку отдельным сообщением
-        btn_msg = await query.message.reply_text("Выберите действие:", reply_markup=kb_back_to_menu())
-        card_msg_id = btn_msg.message_id
-    else:
+    try:
+        if len(photos) == 1 and not videos:
+            msg = await query.message.reply_photo(photo=photos[0], caption=text, reply_markup=kb_back_to_menu(), parse_mode=ParseMode.MARKDOWN)
+            card_msg_id = msg.message_id
+        elif len(videos) == 1 and not photos:
+            msg = await query.message.reply_video(video=videos[0], caption=text, reply_markup=kb_back_to_menu(), parse_mode=ParseMode.MARKDOWN)
+            card_msg_id = msg.message_id
+        elif photos or videos:
+            media = []
+            for idx, fid in enumerate(photos):
+                if idx == 0 and not videos:
+                    media.append(InputMediaPhoto(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
+                else:
+                    media.append(InputMediaPhoto(media=fid))
+            for idx, fid in enumerate(videos):
+                if idx == 0 and not photos:
+                    media.append(InputMediaVideo(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
+                else:
+                    media.append(InputMediaVideo(media=fid))
+            if photos and videos:
+                media[0] = InputMediaPhoto(media=photos[0], caption=text, parse_mode=ParseMode.MARKDOWN)
+
+            msgs = await query.message.reply_media_group(media=media)
+            btn_msg = await query.message.reply_text("Выберите действие:", reply_markup=kb_back_to_menu())
+            card_msg_id = btn_msg.message_id
+        else:
+            msg = await query.message.reply_text(text, reply_markup=kb_back_to_menu(), parse_mode=ParseMode.MARKDOWN)
+            card_msg_id = msg.message_id
+    except Exception as e:
+        logger.warning(f"Ошибка при отправке медиа товара #{product.id}: {e}")
         msg = await query.message.reply_text(text, reply_markup=kb_back_to_menu(), parse_mode=ParseMode.MARKDOWN)
         card_msg_id = msg.message_id
 
     context.user_data['state'] = 'order_qty'
     context.user_data['data'] = {'product_id': product_id, 'card_msg_id': card_msg_id}
-async def search_article_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data['state'] = 'search_article'
-    await query.edit_message_text("🔎 Введите артикул:", reply_markup=kb_back_to_menu())
 
-
-async def search_article_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('state') != 'search_article':
-        return
-    message = update.message
-    article = message.text.strip()
-    if not article:
-        await message.reply_text("❌ Введите артикул.", reply_markup=kb_back_to_menu())
-        return
-    async for session in get_session():
-        product = (await session.execute(
-            select(Product).where(Product.is_active == True, Product.article == article)
-        )).scalar_one_or_none()
-        break
-    if not product:
-        await message.reply_text("🔎 Товар с таким артикулом не найден.", reply_markup=kb_back_to_menu())
-        context.user_data.pop('state', None)
-        return
-
-    text = product.name
-    if product.article:
-        text += f"\nАртикул {product.article}"
-    if product.stock is not None:
-        text += f"\nНа складе: {product.stock}"
-    text += f"\n\nЦена {product.price:.0f} ₽"
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛒 Заказать", callback_data=f"order:start:{product.id}")],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
-    ])
-
-    photos = product.photo_file_ids.split(',') if product.photo_file_ids else []
-    videos = product.video_file_ids.split(',') if product.video_file_ids else []
-
-    if len(photos) == 1 and not videos:
-        await message.reply_photo(photo=photos[0], caption=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-    elif len(videos) == 1 and not photos:
-        await message.reply_video(video=videos[0], caption=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-    elif photos or videos:
-        media = []
-        for idx, fid in enumerate(photos):
-            if idx == 0 and not videos:
-                media.append(InputMediaPhoto(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
-            else:
-                media.append(InputMediaPhoto(media=fid))
-        for idx, fid in enumerate(videos):
-            if idx == 0 and not photos:
-                media.append(InputMediaVideo(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
-            else:
-                media.append(InputMediaVideo(media=fid))
-        if photos and videos:
-            media[0] = InputMediaPhoto(media=photos[0], caption=text, parse_mode=ParseMode.MARKDOWN)
-        msgs = await message.reply_media_group(media=media)
-        await message.reply_text("Выберите действие:", reply_markup=kb)
-    else:
-        await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-
-    context.user_data.pop('state', None)
 def register(app):
     app.add_handler(CallbackQueryHandler(catalog_show_categories, pattern='^catalog:show$'))
     app.add_handler(CallbackQueryHandler(

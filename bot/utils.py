@@ -169,3 +169,7 @@ def _parse_post_link(text: str) -> Optional[int]:
     if m:
         return int(m.group(1))
     return None
+def escape_markdown(text: str) -> str:
+    """Экранирует специальные символы Markdown."""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)

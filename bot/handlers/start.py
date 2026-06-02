@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start — запрос согласия или главное меню."""
     user = update.effective_user
     async for session in get_session():
         db_user = await get_or_create_user(
@@ -35,11 +34,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "✅ Главное меню:",
                 reply_markup=kb_main_menu(is_admin=(user.id == ADMIN_USER_ID))
             )
-            # Отправляем постоянную клавиатуру без текста
-            await update.message.reply_text(
-                "\u200B",
-                reply_markup=reply_main_menu()
-            )
 
 
 async def consent_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -55,12 +49,6 @@ async def consent_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         "✅ Спасибо! Теперь вы можете делать заказы.",
         reply_markup=kb_main_menu(is_admin=(user.id == ADMIN_USER_ID))
-    )
-    # Постоянная клавиатура без текста
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text="\u200B",
-        reply_markup=reply_main_menu()
     )
 
 async def consent_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -116,35 +104,23 @@ async def direct_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатие кнопки 'Главное меню'."""
     query = update.callback_query
     await query.answer()
-    # Очищаем состояние
     context.user_data.pop('state', None)
-    # Удаляем сообщения каталога, если они есть
     for msg_id in context.user_data.pop('catalog_messages', []):
         try:
             await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_id)
         except Exception:
             pass
-    # Удаляем также само сообщение с кнопкой (если оно ещё существует)
     try:
         await query.message.delete()
     except Exception:
         pass
-    # Проверяем, является ли пользователь администратором
     is_admin = (query.from_user.id == ADMIN_USER_ID)
-    # Отправляем новое сообщение с главным меню
     await context.bot.send_message(
         chat_id=query.message.chat_id,
         text="🏠 Главное меню:",
         reply_markup=kb_main_menu(is_admin=is_admin)
-    )
-    # Обновляем постоянную клавиатуру (снизу)
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text="\u200B",
-        reply_markup=reply_main_menu()
     )
 
 

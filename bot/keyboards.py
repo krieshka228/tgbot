@@ -20,6 +20,7 @@ def kb_consent():
 def kb_main_menu(is_admin: bool = False):
     buttons = [
         [InlineKeyboardButton("🛍 Каталог", callback_data="catalog:show")],
+        [InlineKeyboardButton("🔎 Поиск по артикулу", callback_data="search:article")],
         [InlineKeyboardButton("🛒 Корзина", callback_data="cart:view")],
         [InlineKeyboardButton("📋 Мои заказы", callback_data="orders:list")],
         [InlineKeyboardButton("✉️ Написать администратору", callback_data="contact:admin")],

@@ -184,9 +184,13 @@ async def process_search_article(message, text, context):
         await message.reply_text("🔎 Товар с таким артикулом не найден.", reply_markup=kb_back_to_menu())
         context.user_data.pop('state', None)
         return True
-    msg_text = product.name
-    if product.article:
-        msg_text += f"\nАртикул {product.article}"
+
+    # Экранируем спецсимволы
+    name = escape_markdown(product.name)
+    article_str = escape_markdown(product.article) if product.article else None
+    msg_text = name
+    if article_str:
+        msg_text += f"\nАртикул {article_str}"
     if product.stock is not None:
         msg_text += f"\nНа складе: {product.stock}"
     msg_text += f"\n\nЦена {product.price:.0f} ₽"
@@ -194,10 +198,38 @@ async def process_search_article(message, text, context):
         [InlineKeyboardButton("🛒 Заказать", callback_data=f"order:start:{product.id}")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
     ])
-    if product.photo_file_id:
-        await message.reply_photo(photo=product.photo_file_id, caption=msg_text, reply_markup=kb, parse_mode="Markdown")
-    else:
+
+    photos = product.photo_file_ids.split(',') if product.photo_file_ids else []
+    videos = product.video_file_ids.split(',') if product.video_file_ids else []
+
+    try:
+        if len(photos) == 1 and not videos:
+            await message.reply_photo(photo=photos[0], caption=msg_text, reply_markup=kb, parse_mode="Markdown")
+        elif len(videos) == 1 and not photos:
+            await message.reply_video(video=videos[0], caption=msg_text, reply_markup=kb, parse_mode="Markdown")
+        elif photos or videos:
+            media = []
+            for idx, fid in enumerate(photos):
+                if idx == 0 and not videos:
+                    media.append(InputMediaPhoto(media=fid, caption=msg_text, parse_mode="Markdown"))
+                else:
+                    media.append(InputMediaPhoto(media=fid))
+            for idx, fid in enumerate(videos):
+                if idx == 0 and not photos:
+                    media.append(InputMediaVideo(media=fid, caption=msg_text, parse_mode="Markdown"))
+                else:
+                    media.append(InputMediaVideo(media=fid))
+            if photos and videos:
+                media[0] = InputMediaPhoto(media=photos[0], caption=msg_text, parse_mode="Markdown")
+
+            msgs = await message.reply_media_group(media=media)
+            await message.reply_text("Выберите действие:", reply_markup=kb)
+        else:
+            await message.reply_text(msg_text, reply_markup=kb, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"Ошибка отправки медиа при поиске артикула {article}: {e}")
         await message.reply_text(msg_text, reply_markup=kb, parse_mode="Markdown")
+
     context.user_data.pop('state', None)
     return True
 
@@ -584,19 +616,12 @@ async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await process_awaiting_phone(message, content_text, context)
                 return
         if content_text == "🏠 Главное меню":
-            # Отправляем главное меню (как в back_to_menu)
             is_admin = (message.from_user.id == ADMIN_USER_ID)
             await message.reply_text(
                 "🏠 Главное меню:",
                 reply_markup=kb_main_menu(is_admin=is_admin)
             )
-            await message.reply_text(
-                "\u200B",
-                reply_markup=reply_main_menu()
-            )
-            # Очищаем состояние
             context.user_data.pop('state', None)
-            # Удаляем сообщения каталога, если есть
             for msg_id in context.user_data.pop('catalog_messages', []):
                 try:
                     await context.bot.delete_message(chat_id=message.chat_id, message_id=msg_id)

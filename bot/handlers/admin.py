@@ -10,6 +10,7 @@ from bot.config import ADMIN_USER_ID
 from bot.keyboards import kb_admin_menu, kb_back_to_menu, kb_admin_confirm_payment, kb_admin_sync, kb_main_menu
 from bot.excel_reports import build_monthly_report, build_clients_excel
 from bot.db import set_bot_setting, get_bot_setting
+from bot.utils import escape_markdown
 
 logger = logging.getLogger(__name__)
 ITEMS_PER_PAGE = 5
@@ -98,7 +99,8 @@ async def show_stock_products_page(query, context, category: str, page: int):
     for p in products:
         stock_str = f"{p.stock} шт." if p.stock is not None else "∞"
         status = "✅" if p.is_active else "❌ скрыт"
-        lines.append(f"• {p.name} — на складе: {stock_str} {status}")
+        name_escaped = escape_markdown(p.name)
+        lines.append(f"• {name_escaped} — на складе: {stock_str} {status}")
         kb.append([
             InlineKeyboardButton(f"✏️ {p.name[:25]}", callback_data=f"admin:set_stock_select:{p.id}"),
             InlineKeyboardButton("🗑", callback_data=f"admin:delete_prompt:{p.id}")
