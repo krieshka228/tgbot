@@ -27,6 +27,13 @@ async def _sync_post(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = content_text
     name, article, price, category, description, stock = parse_post_product(text)
     logger.info(f"Парсинг: name={name}, article={article}, price={price}, category={category}, stock={stock}")
+
+    # --- Новая проверка: игнорируем посты без артикула ---
+    if not article:
+        logger.info("В посте нет артикула — пропускаем")
+        return
+    # -------------------------------------------------
+
     if name is None:
         logger.info("Парсер не вернул название — товар не будет добавлен")
         return
@@ -38,8 +45,7 @@ async def _sync_post(message, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     photo_file_ids = None
     if message.photo:
-        # Берём только самое большое изображение
-        photo_file_ids = message.photo[-1].file_id
+        photo_file_ids = ",".join([photo.file_id for photo in message.photo])
     video_file_ids = None
     if message.video:
         video_file_ids = message.video.file_id
