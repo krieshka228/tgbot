@@ -10,6 +10,8 @@ from sqlalchemy import select
 from bot.db import Product, get_or_create_draft, add_item_to_order, Order, OrderItem
 from sqlalchemy.orm import selectinload
 from bot.keyboards import kb_consent, kb_main_menu, kb_cart_actions, kb_back_to_menu, reply_main_menu
+from bot.db import get_session, get_bot_setting
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +32,33 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             context.user_data.pop('state', None)
-            await update.message.reply_text(
-                "✅ Главное меню:",
-                reply_markup=kb_main_menu(is_admin=(user.id == ADMIN_USER_ID))
-            )
+            is_admin = (user.id == ADMIN_USER_ID)
+            text, kb = await get_main_menu_info(is_admin)
+            await update.message.reply_text(text, reply_markup=kb)
 
+
+async def get_main_menu_info(is_admin: bool) -> tuple[str, InlineKeyboardMarkup]:
+    """Возвращает текст и клавиатуру главного меню в зависимости от наличия QR‑кода."""
+    if is_admin:
+        return "⚙️ **Админ‑меню:**", kb_main_menu(is_admin=True)
+
+    # Проверяем, загружен ли QR‑код
+    qr_available = False
+    async for session in get_session():
+        token = await get_bot_setting(session, "payment_qr_token")
+        if token:
+            qr_available = True
+            break
+
+    if qr_available:
+        return "✅ Главное меню:", kb_main_menu(is_admin=False)
+    else:
+        # QR‑код не задан – бот недоступен для покупок
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✉️ Написать администратору", callback_data="contact:admin")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
+        ])
+        return "⚠️ Бот временно недоступен. Приносим извинения.", kb
 
 async def consent_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -46,10 +70,9 @@ async def consent_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_user.consented_at = datetime.now(timezone.utc)
         await session.commit()
     context.user_data.pop('state', None)
-    await query.edit_message_text(
-        "✅ Спасибо! Теперь вы можете делать заказы.",
-        reply_markup=kb_main_menu(is_admin=(user.id == ADMIN_USER_ID))
-    )
+    is_admin = (user.id == ADMIN_USER_ID)
+    text, kb = await get_main_menu_info(is_admin)
+    await query.edit_message_text(text, reply_markup=kb)
 
 async def consent_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -117,10 +140,11 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     is_admin = (query.from_user.id == ADMIN_USER_ID)
+    text, kb = await get_main_menu_info(is_admin)
     await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text="🏠 Главное меню:",
-        reply_markup=kb_main_menu(is_admin=is_admin)
+        text=text,
+        reply_markup=kb
     )
 
 

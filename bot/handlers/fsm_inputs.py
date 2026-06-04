@@ -1,11 +1,11 @@
 import logging
 import uuid
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo
 from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from bot.db import get_session, get_or_create_user, get_order_with_items, OrderStatus, Product, Order, OrderItem
 from bot.keyboards import kb_main_menu, kb_back_to_menu, kb_cart_actions, kb_admin_menu, reply_main_menu
 from bot.config import ADMIN_USER_ID, ADMIN_CHAT_ID
-from bot.utils import parse_quantity, _parse_post_link, format_cart, parse_post_product
+from bot.utils import parse_quantity, _parse_post_link, format_cart, parse_post_product, escape_markdown
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from bot.db import upsert_product
@@ -615,19 +615,6 @@ async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 context.user_data['data'] = {'order_id': order.id}
                 await process_awaiting_phone(message, content_text, context)
                 return
-        if content_text == "🏠 Главное меню":
-            is_admin = (message.from_user.id == ADMIN_USER_ID)
-            await message.reply_text(
-                "🏠 Главное меню:",
-                reply_markup=kb_main_menu(is_admin=is_admin)
-            )
-            context.user_data.pop('state', None)
-            for msg_id in context.user_data.pop('catalog_messages', []):
-                try:
-                    await context.bot.delete_message(chat_id=message.chat_id, message_id=msg_id)
-                except Exception:
-                    pass
-            return
         # Если ничего не подошло, пробуем прямой заказ
         handled = await process_direct_order(message, content_text, context)
         if not handled:

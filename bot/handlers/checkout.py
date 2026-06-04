@@ -16,7 +16,18 @@ async def payment_receipt_start(update: Update, context: ContextTypes.DEFAULT_TY
     order_id = int(query.data.split(":")[-1])
     context.user_data['state'] = 'awaiting_receipt'
     context.user_data['data'] = {'order_id': order_id}
-    await query.edit_message_text("📷 Пришлите фото или скриншот чека об оплате:")
+    # Безопасное редактирование: если сообщение не текстовое, удаляем и отправляем новое
+    try:
+        await query.edit_message_text("📷 Пришлите фото или скриншот чека об оплате:")
+    except Exception:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="📷 Пришлите фото или скриншот чека об оплате:"
+        )
 
 
 async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -27,9 +38,28 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async for session in get_session():
         order = await get_order_with_items(session, order_id)
         if order and order.user_id == user_id:
+            # Возвращаем остатки на склад, только если заказ был в статусе pending
+            if order.status == OrderStatus.pending:
+                for item in order.items:
+                    if item.product and item.product.stock is not None:
+                        item.product.stock += item.quantity
+                        item.product.is_active = item.product.stock > 0
+                        item.product.in_stock = item.product.stock > 0
             order.status = OrderStatus.cancelled
             await session.commit()
-            await query.edit_message_text(f"❌ Заказ #{order_id} отменён.", reply_markup=kb_back_to_menu())
+            # Безопасная отправка сообщения об отмене
+            try:
+                await query.edit_message_text(f"❌ Заказ #{order_id} отменён.", reply_markup=kb_back_to_menu())
+            except Exception:
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"❌ Заказ #{order_id} отменён.",
+                    reply_markup=kb_back_to_menu()
+                )
         else:
             await query.edit_message_text("❌ Заказ не найден.")
 
@@ -142,7 +172,18 @@ async def admin_pay_fail(update: Update, context: ContextTypes.DEFAULT_TYPE):
              "Проверьте реквизиты и попробуйте снова или напишите администратору.",
         reply_markup=kb_payment(order_id)
     )
-    await query.edit_message_text(f"❌ Оплата заказа #{order_id} отклонена.")
+    # Безопасное уведомление админа
+    try:
+        await query.edit_message_text(f"❌ Оплата заказа #{order_id} отклонена.")
+    except Exception:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"❌ Оплата заказа #{order_id} отклонена."
+        )
 
 def register(app):
     app.add_handler(CallbackQueryHandler(payment_receipt_start, pattern='^payment:receipt:'))

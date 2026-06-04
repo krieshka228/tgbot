@@ -9,6 +9,7 @@ from bot.config import PAYMENT_DETAILS
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from bot.db import Product, Order, OrderItem   # если используется Product (теперь да)
+from bot.db import get_session, get_bot_setting
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +227,6 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     async for session in get_session():
-        # Загружаем заказ с позициями и товарами
         stmt = (
             select(Order)
             .where(Order.id == order_id, Order.user_id == user_id, Order.status == OrderStatus.draft)
@@ -239,15 +239,11 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Заказ не найден или уже оформлен.")
             return
 
-        # Получаем id всех товаров в заказе
         product_ids = [item.product_id for item in order.items]
-
-        # Блокируем строки продуктов для атомарной проверки
         lock_stmt = select(Product).where(Product.id.in_(product_ids)).with_for_update()
         locked_products = (await session.execute(lock_stmt)).scalars().all()
         product_map = {p.id: p for p in locked_products}
 
-        # Проверяем остатки
         for item in order.items:
             product = product_map.get(item.product_id)
             if product and product.stock is not None and item.quantity > product.stock:
@@ -258,7 +254,6 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        # Списываем остатки и обновляем активность товаров
         for item in order.items:
             product = product_map[item.product_id]
             if product and product.stock is not None:
@@ -266,25 +261,50 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 product.is_active = product.stock > 0
                 product.in_stock = product.stock > 0
 
-        # Меняем статус заказа
         order.status = OrderStatus.pending
         await session.commit()
 
         cart_text = format_cart(order)
 
-    # Отправляем сообщение с реквизитами
+    qr_token = None
+    async for session in get_session():
+        qr_token = await get_bot_setting(session, "payment_qr_token")
+
+    # Основная часть сообщения без текстовых реквизитов
     text = (
         f"✅ **Заказ #{order.id} оформлен!**\n\n"
         f"{cart_text}\n\n"
-        f"💳 **Реквизиты для оплаты:**\n{PAYMENT_DETAILS}\n\n"
-        "После оплаты нажмите кнопку ниже и пришлите фото чека."
+        f"💳 **Оплатите заказ по QR‑коду:**"
     )
+
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💳 Я оплатил — отправить чек", callback_data=f"payment:receipt:{order.id}")],
         [InlineKeyboardButton("❌ Отменить заказ", callback_data=f"payment:cancel:{order.id}")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
     ])
-    await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
+    if qr_token:
+        # Отправляем фото с QR‑кодом и подписью
+        await context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=qr_token,
+            caption=text,
+            reply_markup=kb,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+    else:
+        # QR‑код не задан – сообщаем об этом
+        text = (
+            f"✅ **Заказ #{order.id} оформлен!**\n\n"
+            f"{cart_text}\n\n"
+            "⚠️ Реквизиты не заданы – обратитесь к администратору.\n"
+            "После уточнения реквизитов нажмите кнопку ниже и пришлите чек."
+        )
+        await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 # --------------------------------------------------------
 
 
