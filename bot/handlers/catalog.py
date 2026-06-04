@@ -3,13 +3,14 @@ from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from telegram.constants import ParseMode
 from sqlalchemy import select, func
-from bot.db import get_session, Product, get_or_create_user, get_or_create_draft, add_item_to_order, Order, OrderItem
+from bot.db import get_session, Product, get_or_create_user, get_or_create_draft, add_item_to_order, Order, OrderItem, get_bot_setting
 from sqlalchemy.orm import selectinload
 from bot.keyboards import kb_cart_actions, kb_back_to_menu
 from bot.utils import format_cart, parse_quantity
 from bot.filters import StateFilter
 from telegram import InputMediaPhoto, InputMediaVideo
 from bot.utils import escape_markdown
+from bot.config import ADMIN_USER_ID
 
 
 logger = logging.getLogger(__name__)
@@ -303,6 +304,13 @@ async def catalog_category_page(update: Update, context: ContextTypes.DEFAULT_TY
 async def start_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if query.from_user.id != ADMIN_USER_ID:
+        async for session in get_session():
+            token = await get_bot_setting(session, "payment_qr_token")
+            if not token:
+                await query.answer("⚠️ Бот временно недоступен.", show_alert=True)
+                return
+            break
     product_id = int(query.data.split(":")[-1])
     async for session in get_session():
         product = await session.get(Product, product_id)

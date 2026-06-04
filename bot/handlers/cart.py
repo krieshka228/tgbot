@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from bot.db import Product, Order, OrderItem   # если используется Product (теперь да)
 from bot.db import get_session, get_bot_setting
+from bot.config import ADMIN_USER_ID
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +226,13 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     order_id = int(query.data.split(":")[-1])
     user_id = query.from_user.id
+    if user_id != ADMIN_USER_ID:
+        async for session in get_session():
+            token = await get_bot_setting(session, "payment_qr_token")
+            if not token:
+                await query.edit_message_text("⚠️ Бот временно недоступен.")
+                return
+            break
 
     async for session in get_session():
         stmt = (
