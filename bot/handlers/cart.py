@@ -5,7 +5,6 @@ from telegram.constants import ParseMode
 from bot.db import get_session, get_or_create_user, get_draft_order, remove_item_from_order, recalculate_total, OrderStatus
 from bot.keyboards import kb_cart_actions, kb_cart_items_remove, kb_back_to_menu
 from bot.utils import format_cart
-from bot.config import PAYMENT_DETAILS
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from bot.db import Product, Order, OrderItem   # если используется Product (теперь да)
@@ -30,9 +29,6 @@ async def view_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async for session in get_session():
         user = await get_or_create_user(session, user_id)
-        if not user.consented:
-            await query.edit_message_text("❌ Сначала дайте согласие на обработку данных (/start).")
-            return
         order = await get_draft_order(session, user_id)
 
     if order is None or not order.items:
@@ -221,18 +217,22 @@ async def cart_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Финальное подтверждение с атомарным резервированием товаров."""
+    """Финальное подтверждение заказа с атомарным резервированием и показом QR-кода."""
     query = update.callback_query
     await query.answer()
     order_id = int(query.data.split(":")[-1])
     user_id = query.from_user.id
-    if user_id != ADMIN_USER_ID:
-        async for session in get_session():
-            token = await get_bot_setting(session, "payment_qr_token")
-            if not token:
+
+    # Проверка доступности QR для ВСЕХ пользователей
+    async for session in get_session():
+        token = await get_bot_setting(session, "payment_qr_token")
+        if not token:
+            if user_id == ADMIN_USER_ID:
+                await query.edit_message_text("⚠️ QR-код не задан. Загрузите его в админ‑меню.")
+            else:
                 await query.edit_message_text("⚠️ Бот временно недоступен.")
-                return
-            break
+            return
+        break
 
     async for session in get_session():
         stmt = (
@@ -271,20 +271,19 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         order.status = OrderStatus.pending
         await session.commit()
-
         cart_text = format_cart(order)
 
+    # Получаем QR-код
     qr_token = None
     async for session in get_session():
         qr_token = await get_bot_setting(session, "payment_qr_token")
 
-    # Основная часть сообщения без текстовых реквизитов
+    # Текст без текстовых реквизитов
     text = (
         f"✅ **Заказ #{order.id} оформлен!**\n\n"
         f"{cart_text}\n\n"
-        f"💳 **Оплатите заказ по QR‑коду:**"
+        "После оплаты нажмите кнопку ниже и пришлите фото чека."
     )
-
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💳 Я оплатил — отправить чек", callback_data=f"payment:receipt:{order.id}")],
         [InlineKeyboardButton("❌ Отменить заказ", callback_data=f"payment:cancel:{order.id}")],
@@ -292,7 +291,6 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     if qr_token:
-        # Отправляем фото с QR‑кодом и подписью
         await context.bot.send_photo(
             chat_id=query.message.chat_id,
             photo=qr_token,
@@ -305,13 +303,7 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     else:
-        # QR‑код не задан – сообщаем об этом
-        text = (
-            f"✅ **Заказ #{order.id} оформлен!**\n\n"
-            f"{cart_text}\n\n"
-            "⚠️ Реквизиты не заданы – обратитесь к администратору.\n"
-            "После уточнения реквизитов нажмите кнопку ниже и пришлите чек."
-        )
+        # На всякий случай (хотя проверка выше не пропускает)
         await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 # --------------------------------------------------------
 

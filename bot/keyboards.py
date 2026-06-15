@@ -20,8 +20,9 @@ def kb_consent():
 def kb_main_menu(is_admin: bool = False):
     buttons = [
         [InlineKeyboardButton("🛍 Каталог", callback_data="catalog:show")],
+        [InlineKeyboardButton("🔎 Поиск по названию", callback_data="search:name")],
         [InlineKeyboardButton("🔎 Поиск по артикулу", callback_data="search:article")],
-        [InlineKeyboardButton("🛒 Корзина", callback_data="cart:view")],
+        [InlineKeyboardButton("🛒 Моя корзина", callback_data="cart:view")],
         [InlineKeyboardButton("📋 Мои заказы", callback_data="orders:list")],
         [InlineKeyboardButton("✉️ Написать администратору", callback_data="contact:admin")],
     ]
@@ -41,6 +42,7 @@ def kb_admin_menu():
         [InlineKeyboardButton("🔄 Синхронизация товаров", callback_data="admin:sync")],
         [InlineKeyboardButton("💳 Реквизиты", callback_data="admin:payment_qr")],
         [InlineKeyboardButton("📦 Управление остатками", callback_data="admin:set_stock_list")],
+        [InlineKeyboardButton("🗑 Удалить по артикулам", callback_data="admin:delete_by_articles")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
     ])
 def kb_cart_actions(order_id: int, has_items: bool = True):

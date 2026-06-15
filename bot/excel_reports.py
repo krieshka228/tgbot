@@ -39,7 +39,7 @@ def _auto_width(ws) -> None:
 
 
 def build_monthly_report(orders: list, users: list) -> bytes:
-    """Создаёт Excel с листами «Заказы» и «Клиенты»."""
+    """Создаёт Excel с листами «Заказы» и «Клиенты». Приоритет: @username."""
     wb = openpyxl.Workbook()
 
     # ── Лист 1: Заказы ─────────────────────────────────────────────
@@ -56,7 +56,8 @@ def build_monthly_report(orders: list, users: list) -> bytes:
     row = 2
     for order in orders:
         user = order.user
-        user_name = user.full_name or "—" if user else "—"
+        # Приоритет: @username, иначе full_name
+        user_name = f"@{user.username}" if user and user.username else (user.full_name if user else "—")
         phone = user.phone or "—" if user else "—"
         method = order.delivery_method or "—"
         address = order.delivery_address or "—"
@@ -94,7 +95,7 @@ def build_monthly_report(orders: list, users: list) -> bytes:
 
     # ── Лист 2: Клиенты ─────────────────────────────────────────────
     ws2 = wb.create_sheet("Клиенты")
-    headers2 = ["ID", "Имя", "Телефон", "Адрес", "Согласие ПД", "Дата регистрации"]
+    headers2 = ["ID", "Имя (username)", "Имя (fullname)", "Телефон", "Адрес", "Согласие ПД", "Дата регистрации"]
     for col, h in enumerate(headers2, 1):
         cell = ws2.cell(row=1, column=col, value=h)
         _header_style(cell)
@@ -102,12 +103,13 @@ def build_monthly_report(orders: list, users: list) -> bytes:
     row = 2
     for user in users:
         ws2.cell(row=row, column=1, value=user.id).border = _thin_border()
-        ws2.cell(row=row, column=2, value=user.full_name or "—").border = _thin_border()
-        ws2.cell(row=row, column=3, value=user.phone or "—").border = _thin_border()
-        ws2.cell(row=row, column=4, value=user.address or "—").border = _thin_border()
-        ws2.cell(row=row, column=5, value="Да" if user.consented else "Нет").border = _thin_border()
+        ws2.cell(row=row, column=2, value=f"@{user.username}" if user.username else "—").border = _thin_border()
+        ws2.cell(row=row, column=3, value=user.full_name or "—").border = _thin_border()
+        ws2.cell(row=row, column=4, value=user.phone or "—").border = _thin_border()
+        ws2.cell(row=row, column=5, value=user.address or "—").border = _thin_border()
+        ws2.cell(row=row, column=6, value="Да" if user.consented else "Нет").border = _thin_border()
         date_str = user.created_at.strftime("%d.%m.%Y") if user.created_at else "—"
-        ws2.cell(row=row, column=6, value=date_str).border = _thin_border()
+        ws2.cell(row=row, column=7, value=date_str).border = _thin_border()
         row += 1
 
     _auto_width(ws2)
@@ -118,12 +120,12 @@ def build_monthly_report(orders: list, users: list) -> bytes:
 
 
 def build_clients_excel(users: list) -> bytes:
-    """Создаёт Excel с полной базой клиентов."""
+    """Создаёт Excel с полной базой клиентов. Приоритет: @username."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Клиенты"
 
-    headers = ["ID", "Имя", "Телефон", "Адрес", "Согласие ПД", "Дата регистрации"]
+    headers = ["ID", "Имя (username)", "Имя (fullname)", "Телефон", "Адрес", "Согласие ПД", "Дата регистрации"]
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=h)
         _header_style(cell)
@@ -131,12 +133,13 @@ def build_clients_excel(users: list) -> bytes:
     row = 2
     for user in users:
         ws.cell(row=row, column=1, value=user.id).border = _thin_border()
-        ws.cell(row=row, column=2, value=user.full_name or "—").border = _thin_border()
-        ws.cell(row=row, column=3, value=user.phone or "—").border = _thin_border()
-        ws.cell(row=row, column=4, value=user.address or "—").border = _thin_border()
-        ws.cell(row=row, column=5, value="Да" if user.consented else "Нет").border = _thin_border()
+        ws.cell(row=row, column=2, value=f"@{user.username}" if user.username else "—").border = _thin_border()
+        ws.cell(row=row, column=3, value=user.full_name or "—").border = _thin_border()
+        ws.cell(row=row, column=4, value=user.phone or "—").border = _thin_border()
+        ws.cell(row=row, column=5, value=user.address or "—").border = _thin_border()
+        ws.cell(row=row, column=6, value="Да" if user.consented else "Нет").border = _thin_border()
         date_str = user.created_at.strftime("%d.%m.%Y") if user.created_at else "—"
-        ws.cell(row=row, column=6, value=date_str).border = _thin_border()
+        ws.cell(row=row, column=7, value=date_str).border = _thin_border()
         row += 1
 
     _auto_width(ws)

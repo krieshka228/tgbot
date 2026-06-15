@@ -14,22 +14,22 @@ def parse_quantity(text: str) -> Optional[int]:
     return int(match.group()) if match else None
 
 
+def escape_markdown(text: str) -> str:
+    """Экранирует специальные символы Markdown."""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
+
 def parse_post_product(text: str) -> tuple:
-    """
-    Парсит пост канала с товаром.
-    Возвращает кортеж: (название, артикул, цена, категория, описание, остаток)
-    Если распарсить не удалось, возвращает (None, None, 0.0, None, None, None).
-    """
     if not text:
         return (None, None, 0.0, None, None, None)
 
     lines = [line.strip() for line in text.split('\n') if line.strip()]
 
-    # 1. Поиск цены – ТОЛЬКО в строке с ключевым словом "Цена" или знаком рубля
+    # 1. Поиск цены – только в строке с ключевым словом "Цена" или знаком рубля
     price = 0.0
     price_line_idx = None
     for i, line in enumerate(lines):
-        # Ищем "цена" (как отдельное слово) или символ ₽
         if re.search(r'\bцена\b', line, re.IGNORECASE) or '₽' in line:
             match = re.search(r'(\d[\d\s]*)', line)
             if match:
@@ -51,11 +51,11 @@ def parse_post_product(text: str) -> tuple:
             article_line_idx = i
             break
 
-    # 3. Поиск остатка (ключевые фразы "В наличии", "Stock", "Остаток")
+    # 3. Поиск остатка (ключевые фразы "В наличии", "Stock", "Остаток", "На складе")
     stock = None
     stock_line_idx = None
     for i, line in enumerate(lines):
-        match = re.search(r'(?:В наличии|Stock|Остаток)\s*[:#]?\s*(\d+)', line, re.IGNORECASE)
+        match = re.search(r'(?:В наличии|Stock|Остаток|На складе)\s*[:#]?\s*(\d+)', line, re.IGNORECASE)
         if match:
             stock = int(match.group(1))
             stock_line_idx = i
@@ -64,24 +64,24 @@ def parse_post_product(text: str) -> tuple:
     # 4. Поиск названия: строка над артикулом (если артикул найден) или первая неспециальная строка
     name = None
     if article_line_idx is not None and article_line_idx > 0:
-        # Строка перед артикулом, не содержащая служебных слов (фото, цена, остаток)
         for i in range(article_line_idx - 1, -1, -1):
             candidate = lines[i]
             if ('фотографи' not in candidate.lower() and
                 not re.search(r'\bцена\b', candidate, re.IGNORECASE) and
                 'артикул' not in candidate.lower() and
                 'наличи' not in candidate.lower() and
-                not re.match(r'^\d+$', candidate)):  # не число
+                'на складе' not in candidate.lower() and
+                not re.match(r'^\d+$', candidate)):
                 name = candidate
                 break
         if name is None:
-            name = lines[0]  # fallback
+            name = lines[0]
     else:
-        # Если артикула нет, берём первую строку, не похожую на цену/остаток
         for line in lines:
             if (not re.search(r'\bцена\b', line, re.IGNORECASE) and
                 'артикул' not in line.lower() and
                 'наличи' not in line.lower() and
+                'на складе' not in line.lower() and
                 'фотографи' not in line.lower() and
                 not re.match(r'^\d+$', line)):
                 name = line
@@ -89,21 +89,38 @@ def parse_post_product(text: str) -> tuple:
         if name is None and lines:
             name = lines[0]
 
-    # 5. Категория — первое слово названия (до запятой или пробела)
+    # 5. Категория — первая неслужебная строка после цены
     category = None
-    if name:
-        parts = name.split(',')
-        first_part = parts[0].strip()
-        words = first_part.split()
-        if words:
-            category = words[0]
+    if price_line_idx is not None:
+        for i in range(price_line_idx + 1, len(lines)):
+            candidate = lines[i]
+            if (candidate == name or
+                'артикул' in candidate.lower() or
+                re.search(r'\bцена\b', candidate, re.IGNORECASE) or
+                'наличи' in candidate.lower() or
+                'на складе' in candidate.lower() or
+                'фотографи' in candidate.lower() or
+                re.match(r'^\d+$', candidate)):
+                continue
+            category = candidate
+            break
 
-    # 6. Описание — все строки, которые не являются названием, артикулом, ценой, остатком и не содержат "фотографий"
+    # Удаляем хештеги из категории, если нужно
+    if category:
+        category = re.sub(r'#\w+', '', category).strip()
+
+    # 6. Описание — все строки, которые не являются названием, артикулом, ценой, остатком, категорией и не содержат "фотографий"
     indices_to_skip = {price_line_idx, article_line_idx, stock_line_idx}
     if name:
         try:
             name_idx = lines.index(name)
             indices_to_skip.add(name_idx)
+        except ValueError:
+            pass
+    if category:
+        try:
+            cat_idx = lines.index(category)
+            indices_to_skip.add(cat_idx)
         except ValueError:
             pass
     description_lines = []
@@ -112,13 +129,12 @@ def parse_post_product(text: str) -> tuple:
             continue
         if 'фотографи' in line.lower():
             continue
-        if line == name:
+        if line == name or line == category:
             continue
         description_lines.append(line)
     description = "\n".join(description_lines) if description_lines else None
 
     return (name, article, price, category, description, stock)
-
 
 def format_cart(order) -> str:
     """Форматирует корзину для отображения."""
@@ -126,19 +142,19 @@ def format_cart(order) -> str:
         return "🛒 Корзина пуста."
     lines = [f"🛒 **Заказ #{order.id}**\n"]
     for item in order.items:
-        name = item.product.name if item.product else f"Товар #{item.product_id}"
+        name = escape_markdown(item.product.name) if item.product else f"Товар #{item.product_id}"
         lines.append(f"• {name}: {item.quantity} шт. × {item.price_at_order:.0f} ₽")
     lines.append(f"\n💰 **Итого: {order.total_amount:.0f} ₽**")
     return "\n".join(lines)
 
 
 def format_order_for_admin(order) -> str:
-    """Форматирует информацию о заказе для администратора."""
+    """Форматирует информацию о заказе для администратора. Приоритет: @username."""
     user = order.user
-    user_info = f"{user.full_name or 'Без имени'} (ID {user.id})"
+    user_info = f"@{user.username}" if user and user.username else (user.full_name if user else "Без имени")
     items_lines = []
     for item in order.items:
-        product_name = item.product.name if item.product else f"Товар #{item.product_id}"
+        product_name = escape_markdown(item.product.name) if item.product else f"Товар #{item.product_id}"
         items_lines.append(f"• {product_name}: {item.quantity} шт. × {item.price_at_order:.0f} ₽")
     items_text = "\n".join(items_lines)
     return (
@@ -169,7 +185,3 @@ def _parse_post_link(text: str) -> Optional[int]:
     if m:
         return int(m.group(1))
     return None
-def escape_markdown(text: str) -> str:
-    """Экранирует специальные символы Markdown."""
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)

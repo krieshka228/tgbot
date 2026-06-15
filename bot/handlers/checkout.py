@@ -4,7 +4,7 @@ from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, fil
 from telegram.constants import ParseMode
 from bot.db import get_session, get_order_with_items, OrderStatus
 from bot.keyboards import kb_payment, kb_admin_confirm_payment, kb_main_menu, kb_back_to_menu
-from bot.config import ADMIN_USER_ID, ADMIN_CHAT_ID, PAYMENT_DETAILS
+from bot.config import ADMIN_USER_ID, ADMIN_CHAT_ID
 from bot.utils import format_order_for_admin, format_cart
 
 logger = logging.getLogger(__name__)
