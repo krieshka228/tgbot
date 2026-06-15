@@ -1,6 +1,6 @@
 # Виртуальное окружение
 .venv/
-venv/
+../venv/
 
 # Кэш Python
 __pycache__/
