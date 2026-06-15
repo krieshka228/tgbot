@@ -39,6 +39,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_user = await get_or_create_user(session, user_id,
                                            full_name=user.full_name,
                                            username=user.username)
+        # Проверка отложенного заказа (если есть)
         pending = await session.get(PendingOrder, user_id)
         if pending:
             product = await session.get(Product, pending.product_id)
@@ -65,6 +66,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await session.delete(pending)
                 await session.commit()
 
+        # Удаляем старые сообщения с кнопками (если они остались в user_data)
+        for msg_id in context.user_data.pop('catalog_messages', []):
+            try:
+                await context.bot.delete_message(chat_id=update.message.chat_id, message_id=msg_id)
+            except Exception:
+                pass
+
+        # Определяем доступность QR и показываем актуальное меню
         is_admin = (user_id == ADMIN_USER_ID)
         text, kb = await get_main_menu_info(is_admin)
         await update.message.reply_text(text, reply_markup=kb)
