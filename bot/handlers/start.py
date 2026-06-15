@@ -89,15 +89,31 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_id)
         except Exception:
             pass
+
     is_admin = (query.from_user.id == ADMIN_USER_ID)
     text, kb = await get_main_menu_info(is_admin)
+
+    # Проверяем, не совпадает ли новое содержимое с текущим
+    current_text = query.message.text or query.message.caption
+    current_markup = query.message.reply_markup
+    if current_text == text and current_markup == kb:
+        # Содержимое идентично – просто подтверждаем callback без действий
+        return
+
     # Пытаемся отредактировать текущее сообщение
     try:
         await query.edit_message_text(text=text, reply_markup=kb)
     except Exception:
-        # Если не вышло – шлём новое
-        await context.bot.send_message(chat_id=query.message.chat_id, text=text, reply_markup=kb)
-
+        # Не удалось отредактировать – удаляем текущее и отправляем новое
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=text,
+            reply_markup=kb
+        )
 def register(app):
     app.add_handler(CommandHandler('start', cmd_start))
     app.add_handler(CallbackQueryHandler(back_to_menu, pattern='^menu:main$'))
