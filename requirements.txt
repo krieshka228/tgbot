@@ -5,3 +5,4 @@ aiohttp
 openpyxl
 python-dotenv
 pytz
+asyncpg
