@@ -83,10 +83,17 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data.pop('state', None)
-    # Удаляем сообщения каталога, если они есть
-    for msg_id in context.user_data.pop('catalog_messages', []):
+
+    # Удаляем старые товары и навигацию каталога (если они остались)
+    for msg_id in context.user_data.pop('catalog_product_msgs', []):
         try:
             await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_id)
+        except Exception:
+            pass
+    nav_msg_id = context.user_data.pop('catalog_nav_msg_id', None)
+    if nav_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=nav_msg_id)
         except Exception:
             pass
 

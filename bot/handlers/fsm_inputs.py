@@ -96,17 +96,20 @@ async def process_order_qty(message, text, context):
         order = (await session.execute(stmt)).scalar_one()
         cart_text = f"✅ **{product.name}** × {qty} шт. добавлен в корзину!\n\n{format_cart(order)}"
 
+    # Пытаемся отредактировать сообщение с запросом количества
     if card_msg_id:
         try:
-            await context.bot.edit_message_text(cart_text,
-                                                chat_id=message.chat_id,
-                                                message_id=card_msg_id,
-                                                reply_markup=kb_cart_actions(order.id),
-                                                parse_mode=ParseMode.MARKDOWN)
+            await context.bot.edit_message_text(
+                cart_text,
+                chat_id=message.chat_id,
+                message_id=card_msg_id,
+                reply_markup=kb_cart_actions(order.id),
+                parse_mode="Markdown"
+            )
         except Exception:
-            await message.reply_text(cart_text, reply_markup=kb_cart_actions(order.id), parse_mode=ParseMode.MARKDOWN)
+            await message.reply_text(cart_text, reply_markup=kb_cart_actions(order.id), parse_mode="Markdown")
     else:
-        await message.reply_text(cart_text, reply_markup=kb_cart_actions(order.id), parse_mode=ParseMode.MARKDOWN)
+        await message.reply_text(cart_text, reply_markup=kb_cart_actions(order.id), parse_mode="Markdown")
     context.user_data.pop('state', None)
     return True
 
@@ -206,6 +209,7 @@ async def process_search_name(message, text, context):
         return True
 
     context.user_data['search_results'] = matched
+    context.user_data['search_nav_msg_id'] = None
     await show_search_results_page(message, context, matched, page=0)
     return True
 
@@ -233,7 +237,22 @@ async def show_search_results_page(message, context, products: list, page: int):
         kb.append(nav_buttons)
     kb.append([InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")])
 
-    await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    prev_msg_id = context.user_data.get('search_nav_msg_id')
+    if prev_msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=message.chat_id,
+                message_id=prev_msg_id,
+                text="\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(kb),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            msg = await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+            context.user_data['search_nav_msg_id'] = msg.message_id
+    else:
+        msg = await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        context.user_data['search_nav_msg_id'] = msg.message_id
 
 async def process_awaiting_phone(message, text, context):
     phone = text.strip()
@@ -525,6 +544,7 @@ async def process_admin_set_stock(message, text, context):
     except ValueError:
         await message.reply_text("❌ Введите целое неотрицательное число.", reply_markup=kb_back_to_menu())
         return True
+
     async for session in get_session():
         product = await session.get(Product, product_id)
         if not product:
@@ -535,8 +555,46 @@ async def process_admin_set_stock(message, text, context):
         product.is_active = new_stock > 0
         product.in_stock = new_stock > 0
         await session.commit()
-        await message.reply_text(f"✅ Остаток товара «{product.name}» обновлён: {new_stock}", reply_markup=kb_admin_menu())
+
+    # Удаляем сообщение пользователя с числом
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # Получаем контекст возврата и ID сообщения с запросом остатка
+    return_context = context.user_data.pop('admin_return_context', None)
+    stock_msg_id = context.user_data.pop('admin_stock_msg_id', None)
     context.user_data.pop('state', None)
+
+    if return_context and stock_msg_id:
+        cat = return_context.get('category')
+        sub = return_context.get('subcategory')
+        page = return_context.get('page', 0)
+        if cat:
+            # Создаём фейковый callback query, чтобы переиспользовать show_stock_products_page
+            class FakeQuery:
+                def __init__(self, chat_id, message_id):
+                    self.message = type('obj', (object,), {
+                        'chat_id': chat_id,
+                        'message_id': message_id,
+                        'reply_text': None
+                    })()
+                async def edit_message_text(self, text, reply_markup=None, parse_mode=None):
+                    return await context.bot.edit_message_text(
+                        chat_id=self.message.chat_id,
+                        message_id=self.message.message_id,
+                        text=text,
+                        reply_markup=reply_markup,
+                        parse_mode=parse_mode
+                    )
+            fake_query = FakeQuery(message.chat_id, stock_msg_id)
+            from bot.handlers.admin import show_stock_products_page
+            await show_stock_products_page(fake_query, context, cat, page, subcategory=sub)
+            return True
+
+    # Если контекст не сохранился – просто подтверждение
+    await message.reply_text("✅ Остаток обновлён.", reply_markup=kb_admin_menu())
     return True
 
 async def process_admin_search_article(message, text, context):

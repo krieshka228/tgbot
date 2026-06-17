@@ -70,9 +70,10 @@ async def _sync_post(message, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def process_media_group(context: ContextTypes.DEFAULT_TYPE, group_id: str):
     """Обрабатывает собранную медиагруппу из канала."""
     await asyncio.sleep(1)
-    if group_id not in MEDIA_BUFFER:
+    buffer = context.bot_data.get('media_buffer', {})
+    if group_id not in buffer:
         return
-    data = MEDIA_BUFFER.pop(group_id)
+    data = buffer.pop(group_id)
     caption = data['caption']
     photos = data['photos']
     videos = data['videos']
@@ -109,86 +110,72 @@ async def process_media_group(context: ContextTypes.DEFAULT_TYPE, group_id: str)
         )
         logger.info(f"Товар из альбома обновлён: {name} | арт={article} | цена={price}₽")
 
-
 async def catch_all_channel_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик всех канальных постов с поддержкой медиагрупп."""
     msg = update.channel_post or update.edited_channel_post
     if not msg:
         return
 
-    if msg.media_group_id:
-        group_id = msg.media_group_id
-        if group_id not in MEDIA_BUFFER:
-            MEDIA_BUFFER[group_id] = {
-                'caption': msg.caption or '',
-                'photos': [],
-                'videos': [],
-                'message_ids': [msg.message_id]
-            }
-        else:
-            data = MEDIA_BUFFER[group_id]
-            if msg.caption:
-                data['caption'] = msg.caption
-            data['message_ids'].append(msg.message_id)
-
-        data = MEDIA_BUFFER[group_id]
-        if msg.photo:
-            data['photos'].append(msg.photo[-1].file_id)
-        elif msg.video:
-            data['videos'].append(msg.video.file_id)
-
-        if hasattr(context.application, '_media_tasks'):
-            if group_id in context.application._media_tasks:
-                context.application._media_tasks[group_id].cancel()
-        else:
-            context.application._media_tasks = {}
-        context.application._media_tasks[group_id] = asyncio.create_task(
-            process_media_group(context, group_id)
-        )
+    # Одиночное сообщение (не альбом) – обрабатываем сразу
+    if not msg.media_group_id:
+        await _sync_post(msg, context)
         return
 
-    await _sync_post(msg, context)
+    # Медиагруппа (альбом)
+    group_id = msg.media_group_id
+    if 'media_buffer' not in context.bot_data:
+        context.bot_data['media_buffer'] = {}
+    buffer = context.bot_data['media_buffer']
 
+    if group_id not in buffer:
+        buffer[group_id] = {
+            'caption': msg.caption or '',
+            'photos': [],
+            'videos': [],
+            'message_ids': [msg.message_id]
+        }
+    else:
+        data = buffer[group_id]
+        if msg.caption:
+            data['caption'] = msg.caption
+        data['message_ids'].append(msg.message_id)
 
-# ================== Обработчик комментариев ==================
+    data = buffer[group_id]
+    if msg.photo:
+        data['photos'].append(msg.photo[-1].file_id)
+    elif msg.video:
+        data['videos'].append(msg.video.file_id)
+
+    # Отложенная обработка группы
+    if '_media_tasks' not in context.bot_data:
+        context.bot_data['_media_tasks'] = {}
+    tasks = context.bot_data['_media_tasks']
+    if group_id in tasks:
+        tasks[group_id].cancel()
+    tasks[group_id] = asyncio.create_task(
+        process_media_group(context, group_id)
+    )
+
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает комментарий в группе обсуждения канала."""
     message = update.message
-    logger.info(f"handle_comment вызван! chat_id={message.chat_id}, text={message.text}")
     if not message or not message.text:
-        logger.info("handle_comment: сообщение пустое — выход")
         return
     if str(message.chat_id) != str(DISCUSSION_GROUP_ID):
-        logger.info(f"handle_comment: chat_id не совпадает с DISCUSSION_GROUP_ID ({DISCUSSION_GROUP_ID}) — выход")
         return
 
     user_id = message.from_user.id
     text = message.text.strip()
     qty = parse_quantity(text)
     if qty is None:
-        logger.info("handle_comment: не удалось извлечь количество — выход")
         return
 
-    # Определяем post_id
-    # Определяем post_id (ID оригинального поста в канале)
     post_id = None
     if message.reply_to_message:
-        # Пытаемся получить ID оригинального поста канала через forward_origin
-        if message.reply_to_message.forward_origin and hasattr(message.reply_to_message.forward_origin, 'message_id'):
-            post_id = str(message.reply_to_message.forward_origin.message_id)
-            logger.info(f"handle_comment: forward_origin.message_id={post_id}")
-        else:
-            # Если forward_origin нет, возможно, ответ на обычное сообщение группы (не из канала)
-            post_id = str(message.reply_to_message.message_id)
-            logger.info(f"handle_comment: reply_to_message.message_id={post_id}")
+        post_id = str(message.reply_to_message.message_id)
     elif message.is_topic_message and message.message_thread_id:
         post_id = str(message.message_thread_id)
-        logger.info(f"handle_comment: is_topic_message, post_id={post_id}")
-    else:
-        logger.info("handle_comment: не reply_to_message и не топик — выход")
-        return
-
     if not post_id:
-        logger.info("handle_comment: post_id пустой — выход")
         return
 
     async for session in get_session():
@@ -196,12 +183,10 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             select(Product).where(Product.post_id == post_id, Product.is_active == True)
         )).scalar_one_or_none()
         if not product:
-            logger.info(f"handle_comment: товар с post_id={post_id} не найден или неактивен — выход")
             return
 
         qr_token = await get_bot_setting(session, "payment_qr_token")
         if not qr_token:
-            logger.info("handle_comment: QR-код не задан — удаляем комментарий и выходим")
             try:
                 await message.delete()
             except Exception:
@@ -209,7 +194,6 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if product.stock is not None and qty > product.stock:
-            logger.info("handle_comment: недостаточно товара — удаляем комментарий и выходим")
             try:
                 await message.delete()
             except Exception:
@@ -231,9 +215,8 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=user_id,
                 text=text_msg,
                 reply_markup=kb,
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode="Markdown"
             )
-            logger.info("handle_comment: сообщение отправлено клиенту, удаляем комментарий")
             await message.delete()
             return
         except Exception as e:
@@ -246,9 +229,9 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pending = PendingOrder(user_id=user_id, product_id=product.id, quantity=qty)
                 session.add(pending)
             await session.commit()
-            logger.info("handle_comment: отложенный заказ сохранён, удаляем комментарий")
             await message.delete()
             return
+
 
 def register(app):
     # Универсальный обработчик для канала

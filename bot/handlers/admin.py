@@ -11,6 +11,7 @@ from bot.keyboards import kb_admin_menu, kb_back_to_menu, kb_admin_confirm_payme
 from bot.excel_reports import build_monthly_report, build_clients_excel
 from bot.db import set_bot_setting, get_bot_setting
 from urllib.parse import quote, unquote
+from bot.utils import escape_markdown
 
 logger = logging.getLogger(__name__)
 ITEMS_PER_PAGE = 5
@@ -109,10 +110,10 @@ async def show_stock_subcategories(update: Update, context: ContextTypes.DEFAULT
     end = start + ITEMS_PER_PAGE
     page_subs = all_subs[start:end]
 
-    lines = [f"**Подкатегории: {category}** (стр. {page+1}/{total_pages})\n"]
+    context.user_data['admin_subs'] = {idx: sub for idx, sub in enumerate(page_subs)}
+
+    lines = [f"Подкатегории: {category} (стр. {page+1}/{total_pages})"]
     kb = []
-    # Сохраняем подкатегории в user_data по индексам
-    context.user_data['admin_subs'] = {i: sub for i, sub in enumerate(page_subs)}
     for idx, sub in enumerate(page_subs):
         kb.append([InlineKeyboardButton(sub, callback_data=f"admin:ss:{idx}")])
 
@@ -126,10 +127,14 @@ async def show_stock_subcategories(update: Update, context: ContextTypes.DEFAULT
     kb.append([InlineKeyboardButton("↩️ К категориям", callback_data="admin:set_stock_list")])
     kb.append([InlineKeyboardButton("⚙️ Админ-меню", callback_data="admin:menu")])
 
-    await safe_edit(query, "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-async def show_stock_products_page(query, context, page: int = 0):
-    category = context.user_data.get('admin_current_cat')
-    subcategory = context.user_data.get('admin_current_sub')
+    await safe_edit(query, "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+async def show_stock_products_page(query, context, category: str = None, page: int = 0, subcategory: str = None):
+    # Если категория не передана, берём из user_data
+    if category is None:
+        category = context.user_data.get('admin_current_cat')
+    if subcategory is None:
+        subcategory = context.user_data.get('admin_current_sub')
+
     if not category:
         await safe_edit(query, "Сначала выберите категорию.", reply_markup=kb_back_to_menu())
         return
@@ -139,8 +144,7 @@ async def show_stock_products_page(query, context, page: int = 0):
         if subcategory:
             stmt = stmt.where(
                 (Product.name == subcategory) |
-                (Product.name.startswith(subcategory + ',')) |
-                (Product.name.startswith(subcategory + ' '))
+                (Product.name.startswith(subcategory + ','))
             )
         total = (await session.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
         products = (await session.execute(
@@ -153,19 +157,19 @@ async def show_stock_products_page(query, context, page: int = 0):
 
     total_pages = (total - 1) // ITEMS_PER_PAGE + 1
     cat_display = f"{category} / {subcategory}" if subcategory else category
-    lines = [f"**Остатки: {cat_display}** (стр. {page+1}/{total_pages})\n"]
+    lines = [f"Остатки: {cat_display} (стр. {page+1}/{total_pages})"]
     kb = []
 
     for p in products:
+        name_escaped = escape_markdown(p.name)
         stock_str = f"{p.stock} шт." if p.stock is not None else "∞"
         status = "✅" if p.is_active else "❌ скрыт"
-        lines.append(f"• {p.name} — на складе: {stock_str} {status}")
+        lines.append(f"• {name_escaped} — на складе: {stock_str} {status}")
         kb.append([
             InlineKeyboardButton(f"✏️ {p.name[:25]}", callback_data=f"admin:set_stock_select:{p.id}"),
             InlineKeyboardButton("🗑", callback_data=f"admin:delete_prompt:{p.id}")
         ])
 
-    # Навигация
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton("← Назад", callback_data=f"admin:prodpage:{page-1}"))
@@ -180,7 +184,7 @@ async def show_stock_products_page(query, context, page: int = 0):
         kb.append([InlineKeyboardButton("↩️ К категориям", callback_data="admin:set_stock_list")])
     kb.append([InlineKeyboardButton("⚙️ Админ-меню", callback_data="admin:menu")])
 
-    await safe_edit(query, "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    await safe_edit(query, "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
 # ========== Обработчики команд ==========
 
 async def back_to_subcategories(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,10 +433,25 @@ async def set_stock_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Нет доступа.", show_alert=True)
         return
     product_id = int(query.data.split(":")[-1])
+    # Сохраняем контекст для возврата
+    context.user_data['admin_return_context'] = {
+        'category': context.user_data.get('admin_current_cat'),
+        'subcategory': context.user_data.get('admin_current_sub'),
+        'page': context.user_data.get('admin_current_page', 0)
+    }
     context.user_data['state'] = 'admin_set_stock'
     context.user_data['data'] = {'product_id': product_id}
-    await safe_edit(query, "✏️ Введите новое количество (целое число) или 0, чтобы скрыть товар:",
-                    reply_markup=kb_back_to_menu())
+    # Отправляем запрос и сохраняем его message_id
+    sent_msg = await query.message.reply_text(
+        "✏️ Введите новое количество (целое число) или 0, чтобы скрыть товар:",
+        reply_markup=kb_back_to_menu()
+    )
+    context.user_data['admin_stock_msg_id'] = sent_msg.message_id
+    # Удаляем исходное сообщение с кнопкой (чтобы не мешало)
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
 
 
 async def delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -501,6 +520,7 @@ async def admin_search_article_start(update: Update, context: ContextTypes.DEFAU
 
 def register(app):
     # Админ-меню и отчёты
+    app.add_handler(CallbackQueryHandler(stock_catpage, pattern='^admin:stock_catpage:'))
     app.add_handler(CallbackQueryHandler(admin_menu, pattern='^admin:menu$'))
     app.add_handler(CallbackQueryHandler(excel_monthly, pattern='^admin:excel:summary$'))
     app.add_handler(CallbackQueryHandler(excel_clients, pattern='^admin:excel:clients$'))

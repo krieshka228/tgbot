@@ -33,16 +33,12 @@ async def catalog_show_categories(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
 
-    # Очищаем старые сообщения каталога
-    for msg_id in context.user_data.pop('catalog_messages', []):
+    # Удаляем старые сообщения каталога (товары и навигацию), но НЕ сообщение с категориями
+    for msg_id in context.user_data.pop('catalog_product_msgs', []):
         try:
             await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_id)
         except Exception:
             pass
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
 
     async for session in get_session():
         all_categories = (await session.execute(
@@ -50,12 +46,7 @@ async def catalog_show_categories(update: Update, context: ContextTypes.DEFAULT_
         )).scalars().all()
 
     if not all_categories:
-        msg = await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="📭 В каталоге пока нет категорий.",
-            reply_markup=kb_back_to_menu()
-        )
-        context.user_data['catalog_messages'] = [msg.message_id]
+        await query.edit_message_text("📭 В каталоге пока нет категорий.", reply_markup=kb_back_to_menu())
         return
 
     total = len(all_categories)
@@ -64,7 +55,6 @@ async def catalog_show_categories(update: Update, context: ContextTypes.DEFAULT_
     end = start + ITEMS_PER_PAGE
     page_categories = all_categories[start:end]
 
-    # Сохраняем категории в user_data по индексам, чтобы передавать только индекс в callback
     context.user_data['catalog_cats'] = {idx: cat for idx, cat in enumerate(page_categories)}
 
     kb = []
@@ -81,44 +71,41 @@ async def catalog_show_categories(update: Update, context: ContextTypes.DEFAULT_
     kb.append([InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")])
 
     nav_text = f"**Категории** (стр. {page+1}/{total_pages})"
-    msg = await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text=nav_text,
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode=ParseMode.MARKDOWN
-    )
-    context.user_data['catalog_messages'] = [msg.message_id]
+    try:
+        await query.edit_message_text(nav_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        # Если редактирование не удалось, отправляем новое
+        msg = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=nav_text,
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        context.user_data['catalog_nav_msg_id'] = msg.message_id
 
 
 # ================== УРОВЕНЬ 2: подкатегории ==================
 async def catalog_show_subcategories(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
-    """Показывает подкатегории для ранее выбранной категории (из user_data)."""
     query = update.callback_query
     await query.answer()
 
     category = context.user_data.get('catalog_current_cat')
     if not category:
-        # Если категория не выбрана (например, при прямом вызове), возвращаемся в категории
         await catalog_show_categories(update, context)
         return
 
-    # Очищаем старые сообщения
-    for msg_id in context.user_data.pop('catalog_messages', []):
+    # Удаляем старые товары, но не сообщение подкатегорий
+    for msg_id in context.user_data.pop('catalog_product_msgs', []):
         try:
             await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_id)
         except Exception:
             pass
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
 
     async for session in get_session():
         products = (await session.execute(
             select(Product).where(Product.is_active == True, Product.category == category)
         )).scalars().all()
 
-    # Формируем список подкатегорий (часть названия до первой запятой)
     subcategories = {}
     for p in products:
         if ',' in p.name:
@@ -128,12 +115,7 @@ async def catalog_show_subcategories(update: Update, context: ContextTypes.DEFAU
         subcategories[sub] = subcategories.get(sub, 0) + 1
 
     if not subcategories:
-        msg = await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=f"В категории «{category}» пока нет товаров.",
-            reply_markup=kb_back_to_menu()
-        )
-        context.user_data['catalog_messages'] = [msg.message_id]
+        await query.edit_message_text(f"В категории «{category}» пока нет товаров.", reply_markup=kb_back_to_menu())
         return
 
     all_subs = sorted(subcategories.keys())
@@ -143,7 +125,6 @@ async def catalog_show_subcategories(update: Update, context: ContextTypes.DEFAU
     end = start + ITEMS_PER_PAGE
     page_subs = all_subs[start:end]
 
-    # Сохраняем подкатегории в user_data по индексам
     context.user_data['catalog_subs'] = {idx: sub for idx, sub in enumerate(page_subs)}
 
     kb = []
@@ -160,13 +141,17 @@ async def catalog_show_subcategories(update: Update, context: ContextTypes.DEFAU
     kb.append([InlineKeyboardButton("↩️ К категориям", callback_data="catalog:show")])
     kb.append([InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")])
 
-    msg = await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text=f"**{category}** — выберите подкатегорию:",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode=ParseMode.MARKDOWN
-    )
-    context.user_data['catalog_messages'] = [msg.message_id]
+    nav_text = f"**{category}** — выберите подкатегорию:"
+    try:
+        await query.edit_message_text(nav_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        msg = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=nav_text,
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        context.user_data['catalog_nav_msg_id'] = msg.message_id
 
 
 # ================== ТОВАРЫ ==================
@@ -183,8 +168,7 @@ async def show_products_page(query, context, page: int = 0):
         if subcategory:
             stmt = stmt.where(
                 (Product.name == subcategory) |
-                (Product.name.startswith(subcategory + ',')) |
-                (Product.name.startswith(subcategory + ' '))
+                (Product.name.startswith(subcategory + ','))
             )
         total = (await session.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
         products = (await session.execute(
@@ -194,6 +178,13 @@ async def show_products_page(query, context, page: int = 0):
     if not products:
         await query.edit_message_text(f"Товары не найдены.", reply_markup=kb_back_to_menu())
         return
+
+    # Удаляем старые карточки товаров, но не навигационное сообщение
+    for msg_id in context.user_data.pop('catalog_product_msgs', []):
+        try:
+            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_id)
+        except Exception:
+            pass
 
     new_msgs = []
     chat_id = query.message.chat_id
@@ -247,29 +238,43 @@ async def show_products_page(query, context, page: int = 0):
             msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
             new_msgs.append(msg.message_id)
 
+    context.user_data['catalog_product_msgs'] = new_msgs
+
+    # Навигационное сообщение (редактируем предыдущее или отправляем новое)
     total_pages = (total - 1) // ITEMS_PER_PAGE + 1
-    nav = []
+    nav_text = f"**{category} / {subcategory or 'все'}** (стр. {page+1}/{total_pages})"
+    nav_kb = []
     if page > 0:
-        nav.append(InlineKeyboardButton("← Назад", callback_data=f"catalog:prodpage:{page-1}"))
+        nav_kb.append(InlineKeyboardButton("← Назад", callback_data=f"catalog:prodpage:{page-1}"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Вперёд →", callback_data=f"catalog:prodpage:{page+1}"))
+        nav_kb.append(InlineKeyboardButton("Вперёд →", callback_data=f"catalog:prodpage:{page+1}"))
     kb_nav = []
-    if nav:
-        kb_nav.append(nav)
+    if nav_kb:
+        kb_nav.append(nav_kb)
     if subcategory:
         kb_nav.append([InlineKeyboardButton("↩️ К подкатегориям", callback_data="catalog:back_to_subs")])
     else:
         kb_nav.append([InlineKeyboardButton("↩️ К категориям", callback_data="catalog:show")])
     kb_nav.append([InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")])
-    nav_text = f"**{category} / {subcategory or 'все'}** (стр. {page+1}/{total_pages})"
-    msg_nav = await bot.send_message(chat_id=chat_id, text=nav_text,
-                                      reply_markup=InlineKeyboardMarkup(kb_nav), parse_mode=ParseMode.MARKDOWN)
-    new_msgs.append(msg_nav.message_id)
-    context.user_data['catalog_messages'] = new_msgs
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
+
+    prev_nav_msg_id = context.user_data.get('catalog_nav_msg_id')
+    if prev_nav_msg_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=prev_nav_msg_id,
+                text=nav_text,
+                reply_markup=InlineKeyboardMarkup(kb_nav),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            msg = await bot.send_message(chat_id=chat_id, text=nav_text, reply_markup=InlineKeyboardMarkup(kb_nav), parse_mode=ParseMode.MARKDOWN)
+            context.user_data['catalog_nav_msg_id'] = msg.message_id
+    else:
+        msg = await bot.send_message(chat_id=chat_id, text=nav_text, reply_markup=InlineKeyboardMarkup(kb_nav), parse_mode=ParseMode.MARKDOWN)
+        context.user_data['catalog_nav_msg_id'] = msg.message_id
+
+    # Больше не удаляем текущее сообщение – оно теперь является навигационным
 
 
 # ================== ЗАКАЗ ==================
