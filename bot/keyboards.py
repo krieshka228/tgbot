@@ -43,6 +43,7 @@ def kb_admin_menu():
         [InlineKeyboardButton("💳 Реквизиты", callback_data="admin:payment_qr")],
         [InlineKeyboardButton("📦 Управление остатками", callback_data="admin:set_stock_list")],
         [InlineKeyboardButton("🗑 Удалить по артикулам", callback_data="admin:delete_by_articles")],
+        [InlineKeyboardButton("🔗 Привязать пост к товару", callback_data="admin:link_post")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
     ])
 def kb_cart_actions(order_id: int, has_items: bool = True):

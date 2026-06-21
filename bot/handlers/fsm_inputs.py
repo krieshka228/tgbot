@@ -6,19 +6,51 @@ from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputMe
 from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from telegram.constants import ParseMode
 from bot.db import get_session, get_or_create_user, get_order_with_items, OrderStatus, Product, Order, OrderItem, PendingOrder, get_bot_setting, set_bot_setting
+from bot.db import get_all_active_products, invalidate_catalog_cache
 from bot.keyboards import kb_main_menu, kb_back_to_menu, kb_cart_actions, kb_admin_menu, reply_main_menu
 from bot.config import ADMIN_USER_ID, ADMIN_CHAT_ID, DISCUSSION_GROUP_ID
 from bot.utils import parse_quantity, _parse_post_link, format_cart, parse_post_product, escape_markdown
+from bot.validators import normalize_phone, parse_positive_int, parse_non_negative_int
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from bot.db import upsert_product
 from sqlalchemy import delete as sql_delete
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, MessageOriginChannel
+from bot.utils import parse_quantity, _parse_post_link, format_cart, parse_post_product, escape_markdown, upload_photo_to_max, upload_video_to_max
 
 MEDIA_GROUP_TIMEOUT = 5
 ITEMS_PER_PAGE = 3
 logger = logging.getLogger(__name__)
 
 # ================== Обработчики состояний ==================
+def _resolve_post_id(message) -> str | None:
+    """Определяет id поста КАНАЛА (Product.post_id) по комментарию в группе.
+
+    В связанной группе обсуждения Telegram автоматически репостит пост канала,
+    и комментарий приходит как reply на ЭТОТ репост. У репоста собственный
+    ``message_id`` (id сообщения в группе), который НЕ совпадает с id поста в
+    канале. Правильный id канала лежит в ``forward_origin`` репоста
+    (``MessageOriginChannel.message_id``) — именно его мы сохраняли как
+    ``Product.post_id``. Это и была причина, по которой товар не находился.
+    """
+    reply = message.reply_to_message
+    if reply is not None:
+        origin = getattr(reply, "forward_origin", None)
+        if isinstance(origin, MessageOriginChannel):
+            # Явно приводим к строке
+            return str(origin.message_id)
+        # Фолбэк: если это не авто-репост канала — берём id самого сообщения.
+        # Но это может быть неправильно, логируем предупреждение.
+        logger.debug(
+            "reply_to_message without MessageOriginChannel, using reply.message_id",
+            extra={"reply_id": reply.message_id}
+        )
+        return str(reply.message_id)
+    # Темы форума: тред привязан к корневому сообщению.
+    if message.message_thread_id:
+        logger.debug("using message_thread_id as post_id", extra={"thread_id": message.message_thread_id})
+        return str(message.message_thread_id)
+    return None
 
 async def _process_delayed_media_group(context: ContextTypes.DEFAULT_TYPE, group_id: str):
     await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
@@ -93,24 +125,36 @@ async def process_order_qty(message, text, context):
         stmt = select(Order).where(Order.id == order.id).options(selectinload(Order.items).selectinload(OrderItem.product))
         order = (await session.execute(stmt)).scalar_one()
         await add_item_to_order(session, order, product, qty)
+        # Обновляем order
         order = (await session.execute(stmt)).scalar_one()
-        cart_text = f"✅ **{product.name}** × {qty} шт. добавлен в корзину!\n\n{format_cart(order)}"
 
-    # Пытаемся отредактировать сообщение с запросом количества
+    # --- НОВОЕ СООБЩЕНИЕ С ПОДТВЕРЖДЕНИЕМ ---
+    safe_name = escape_markdown(product.name)
+    confirm_text = f"✅ **{safe_name}** × {qty} шт. добавлен в корзину!"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 Перейти в корзину", callback_data="cart:view")],
+        [InlineKeyboardButton("📦 Продолжить покупки", callback_data="catalog:show")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
+    ])
+
+    # Если карточка товара была отправлена – редактируем её
     if card_msg_id:
         try:
             await context.bot.edit_message_text(
-                cart_text,
                 chat_id=message.chat_id,
                 message_id=card_msg_id,
-                reply_markup=kb_cart_actions(order.id),
-                parse_mode="Markdown"
+                text=confirm_text,
+                reply_markup=kb,
+                parse_mode=ParseMode.MARKDOWN
             )
         except Exception:
-            await message.reply_text(cart_text, reply_markup=kb_cart_actions(order.id), parse_mode="Markdown")
+            # Если редактирование не удалось, отправляем новое сообщение
+            await message.reply_text(confirm_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
     else:
-        await message.reply_text(cart_text, reply_markup=kb_cart_actions(order.id), parse_mode="Markdown")
+        await message.reply_text(confirm_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
     context.user_data.pop('state', None)
+    context.user_data.pop('data', None)
     return True
 
 async def process_cart_change_qty(message, text, context):
@@ -120,11 +164,8 @@ async def process_cart_change_qty(message, text, context):
         await message.reply_text("❌ Ошибка. Попробуйте снова.")
         context.user_data.pop('state', None)
         return True
-    try:
-        new_qty = int(text.strip())
-        if new_qty <= 0:
-            raise ValueError
-    except ValueError:
+    new_qty = parse_positive_int(text)
+    if new_qty is None:
         await message.reply_text("❌ Введите целое положительное число.", reply_markup=kb_back_to_menu())
         return True
     user_id = message.from_user.id
@@ -161,25 +202,33 @@ async def process_search_article(message, text, context):
     if not article:
         await message.reply_text("❌ Введите артикул.", reply_markup=kb_back_to_menu())
         return True
+
     async for session in get_session():
-        product = (await session.execute(
-            select(Product).where(Product.is_active == True, Product.article == article)
-        )).scalar_one_or_none()
+        products = (await session.execute(
+            select(Product).where(Product.article == article, Product.is_active == True)
+        )).scalars().all()
         break
-    if not product:
+
+    if not products:
         await message.reply_text("🔎 Товар с таким артикулом не найден.", reply_markup=kb_back_to_menu())
         context.user_data.pop('state', None)
         return True
+
+    # Берём первый активный товар
+    product = products[0]
+
     msg_text = escape_markdown(product.name)
     if product.article:
         msg_text += f"\nАртикул {escape_markdown(product.article)}"
     if product.stock is not None:
         msg_text += f"\nНа складе: {product.stock}"
     msg_text += f"\n\nЦена {product.price:.0f} ₽"
+
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🛒 Заказать", callback_data=f"order:start:{product.id}")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
     ])
+
     try:
         if product.photo_file_ids:
             photo = product.photo_file_ids.split(',')[0]
@@ -189,6 +238,7 @@ async def process_search_article(message, text, context):
     except Exception as e:
         logger.warning(f"Ошибка отправки фото для артикула {article}: {e}")
         await message.reply_text(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
     context.user_data.pop('state', None)
     return True
 
@@ -199,9 +249,7 @@ async def process_search_name(message, text, context):
 
     search_substr = text.strip().lower()
     async for session in get_session():
-        all_products = (await session.execute(
-            select(Product).where(Product.is_active == True)
-        )).scalars().all()
+        all_products = await get_all_active_products(session)
         matched = [p for p in all_products if search_substr in p.name.lower()]
 
     if not matched:
@@ -255,9 +303,9 @@ async def show_search_results_page(message, context, products: list, page: int):
         context.user_data['search_nav_msg_id'] = msg.message_id
 
 async def process_awaiting_phone(message, text, context):
-    phone = text.strip()
-    if not phone or not phone.replace('+', '').replace(' ', '').isdigit():
-        await message.reply_text("❌ Введите корректный номер телефона (цифры, можно с +).")
+    phone = normalize_phone(text)
+    if not phone:
+        await message.reply_text("❌ Введите корректный номер телефона (10–15 цифр, можно с +).")
         return True
     user_id = message.from_user.id
     order_id = None
@@ -289,17 +337,44 @@ async def process_awaiting_phone(message, text, context):
         user = await get_or_create_user(session, user_id)
         user.phone = phone
         await session.commit()
-    context.user_data['state'] = 'awaiting_delivery_method'
+    # Переход к запросу ФИО вместо сразу доставки
+    context.user_data['state'] = 'awaiting_full_name'
     context.user_data['data'] = {'order_id': order_id}
+    await message.reply_text("✏️ Введите ваше полное имя (ФИО) для заказа:")
+    return True
+async def process_awaiting_full_name(message, text, context):
+    full_name = text.strip()
+    if not full_name:
+        await message.reply_text("❌ Введите ваше полное имя (ФИО).")
+        return True
+    user_id = message.from_user.id
+    data = context.user_data.get('data', {})
+    order_id = data.get('order_id')
+    if not order_id:
+        await message.reply_text("❌ Нет активного заказа для заполнения ФИО.")
+        context.user_data.pop('state', None)
+        return True
+    async for session in get_session():
+        order = await get_order_with_items(session, order_id)
+        if not order or order.user_id != user_id:
+            await message.reply_text("❌ Заказ не найден.")
+            context.user_data.pop('state', None)
+            return True
+        order.full_name = full_name
+        # Сохраняем в профиль пользователя
+        user = await get_or_create_user(session, user_id)
+        user.full_name = full_name
+        await session.commit()
+    # Переход к выбору доставки
+    context.user_data['state'] = 'awaiting_delivery_method'
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Озон", callback_data="delivery:ozon"),
          InlineKeyboardButton("Яндекс", callback_data="delivery:yandex")],
         [InlineKeyboardButton("СДЭК до ПВЗ", callback_data="delivery:cdek")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
     ])
-    await message.reply_text("🚚 Выберите способ доставки:", reply_markup=kb)
+    await message.reply_text("✅ ФИО сохранено!\n\n🚚 Теперь выберите способ доставки:", reply_markup=kb)
     return True
-
 async def process_awaiting_address(message, text, context):
     address = text.strip()
     if not address:
@@ -326,7 +401,7 @@ async def process_awaiting_address(message, text, context):
         f"📋 **Проверьте данные заказа:**\n\n"
         f"📱 Телефон: {phone}\n"
         f"🚚 Доставка: {method}\n"
-        f"📍 Адрес: {address}\n"
+        f"📍 Адрес: {escape_markdown(address)}\n"
         f"💰 Сумма: {total:.0f} ₽"
     )
     kb = InlineKeyboardMarkup([
@@ -352,14 +427,24 @@ async def confirm_data_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('state', None)
             return
         user = order.user
+        # ФИО для отправки: берём из заказа, иначе из профиля пользователя
+        # (Telegram-имя). Если ничего нет — оставляем поле пустым.
+        if not order.full_name and user and user.full_name:
+            order.full_name = user.full_name
+            await session.commit()
+        fio = order.full_name or (user.full_name if user else None)
+        full_name = escape_markdown(fio) if fio else 'Без имени'
+        address = escape_markdown(order.delivery_address) if order.delivery_address else 'не указан'
         admin_text = f"📦 **Заказ #{order_id} готов к отправке**\n\n" \
-                     f"👤 Клиент: {user.full_name or 'Без имени'} (ID {user.id})\n" \
+                     f"👤 Клиент: {full_name} (ID {user.id})\n" \
                      f"📱 Телефон: {user.phone or 'не указан'}\n" \
                      f"🚚 Доставка: {order.delivery_method}\n" \
-                     f"📍 Адрес: {order.delivery_address}\n\n" \
+                     f"📍 Адрес: {address}\n\n" \
                      f"💰 Итого: {order.total_amount:.0f} ₽"
         try:
             await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_text, parse_mode=ParseMode.MARKDOWN)
+            logger.info("order ready, admin notified",
+                        extra={"event": "order_ready", "user_id": user_id, "order_id": order_id})
         except Exception as e:
             logger.error(f"Не удалось отправить уведомление: {e}")
     context.user_data.pop('state', None)
@@ -386,12 +471,15 @@ async def process_contact_admin(message, text, context):
     if not text.strip():
         await message.reply_text("Напишите ваш вопрос текстом.")
         return True
-    sender_name = message.from_user.full_name or f"ID {message.from_user.id}"
-    fwd_text = f"✉️ **Сообщение от клиента**\nКлиент: {sender_name} (ID: {message.from_user.id})\n\n{text.strip()}"
+    sender_name = escape_markdown(message.from_user.full_name) if message.from_user.full_name else f"ID {message.from_user.id}"
+    fwd_text = f"✉️ **Сообщение от клиента**\nКлиент: {sender_name} (ID: {message.from_user.id})\n\n{escape_markdown(text.strip())}"
     try:
         await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=fwd_text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Не удалось переслать сообщение: {e}")
+        await message.reply_text("❌ Не удалось отправить сообщение администратору. Попробуйте позже.")
+        context.user_data.pop('state', None)
+        return True
     context.user_data.pop('state', None)
     await message.reply_text("✅ Сообщение отправлено администратору!",
                              reply_markup=kb_main_menu(is_admin=(message.from_user.id == ADMIN_USER_ID)))
@@ -450,17 +538,37 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
     photo_file_ids = ",".join(photos) if photos else None
     video_file_ids = ",".join(videos) if videos else None
 
+    # --- Загрузка медиа в Max (ключевое исправление!) ---
+    max_photo_ids = None
+    if photos:
+        tokens = []
+        for file_id in photos:
+            token = await upload_photo_to_max(file_id, context.bot)
+            if token:
+                tokens.append(token)
+        max_photo_ids = ",".join(tokens) if tokens else None
+
+    max_video_ids = None
+    if videos:
+        tokens = []
+        for file_id in videos:
+            token = await upload_video_to_max(file_id, context.bot)
+            if token:
+                tokens.append(token)
+        max_video_ids = ",".join(tokens) if tokens else None
+
     async for session in get_session():
-        await upsert_product(
+        product = await upsert_product(
             session, post_id, name, price,
             photo_file_ids=photo_file_ids,
             video_file_ids=video_file_ids,
+            max_photo_ids=max_photo_ids,
+            max_video_ids=max_video_ids,
             article=article, category=category,
             description=description,
-            in_stock=(stock is not None and stock > 0),  # <-- теперь зависит от остатка
+            in_stock=(stock is not None and stock > 0),
             stock=stock,
         )
-        # Принудительно больше не скрываем – upsert_product сама выставит is_active
 
     try:
         await message.delete()
@@ -474,9 +582,13 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
         except Exception:
             pass
 
+    if product.is_active:
+        status_note = f"виден покупателям, остаток {product.stock} шт."
+    else:
+        status_note = f"скрыт, остаток {product.stock or 0} шт."
     await context.bot.send_message(
         chat_id=message.chat_id,
-        text=f"✅ Добавлен товар: «{name}» (скрыт, остаток 0)",
+        text=f"✅ Добавлен товар: «{name}» ({status_note})",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]])
     )
     context.user_data['sync_count'] = context.user_data.get('sync_count', 0) + 1
@@ -516,6 +628,9 @@ async def process_admin_delete_by_articles(message, text, context):
                 not_found.append(art)
         await session.commit()
 
+    if deleted_names:
+        invalidate_catalog_cache()
+
     # Формируем ответ
     text_parts = []
     if deleted_names:
@@ -537,11 +652,8 @@ async def process_admin_set_stock(message, text, context):
         return True
     data = context.user_data.get('data', {})
     product_id = data.get('product_id')
-    try:
-        new_stock = int(text.strip())
-        if new_stock < 0:
-            raise ValueError
-    except ValueError:
+    new_stock = parse_non_negative_int(text)
+    if new_stock is None:
         await message.reply_text("❌ Введите целое неотрицательное число.", reply_markup=kb_back_to_menu())
         return True
 
@@ -555,6 +667,7 @@ async def process_admin_set_stock(message, text, context):
         product.is_active = new_stock > 0
         product.in_stock = new_stock > 0
         await session.commit()
+        invalidate_catalog_cache()
 
     # Удаляем сообщение пользователя с числом
     try:
@@ -613,6 +726,42 @@ async def process_admin_search_article(message, text, context):
     )
     return True
 
+async def process_admin_link_post(message, text, context):
+    """Ручная привязка товара к посту: ввод '<product_id> <post_id>'."""
+    if message.from_user.id != ADMIN_USER_ID:
+        return True
+    parts = text.split()
+    if len(parts) != 2 or not parts[0].isdigit():
+        await message.reply_text(
+            "❌ Формат: <код товара> <post_id>. Например: 42 1287",
+            reply_markup=kb_back_to_menu(),
+        )
+        return True
+    product_id = int(parts[0])
+    post_id = parts[1].strip()
+
+    async for session in get_session():
+        product = await session.get(Product, product_id)
+        if not product:
+            await message.reply_text(f"❌ Товар #{product_id} не найден.",
+                                     reply_markup=kb_admin_menu())
+            context.user_data.pop('state', None)
+            return True
+        product.post_id = post_id
+        await session.commit()
+        invalidate_catalog_cache()
+        product_name = product.name
+
+    context.user_data.pop('state', None)
+    logger.info("admin linked post to product",
+                extra={"event": "link_post", "product_id": product_id, "post_id": post_id})
+    await message.reply_text(
+        f"✅ Товар «{product_name}» (#{product_id}) привязан к посту {post_id}.",
+        reply_markup=kb_admin_menu(),
+    )
+    return True
+
+
 async def process_direct_order(message, text, context):
     parts = text.strip().split(maxsplit=1)
     if len(parts) != 2:
@@ -643,13 +792,16 @@ async def process_direct_order(message, text, context):
     return True
 
 async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение отложенного заказа из комментария."""
     query = update.callback_query
     await query.answer()
     parts = query.data.split(":")
+    # формат: porder:confirm:product_id:qty
     product_id = int(parts[2])
     qty = int(parts[3])
     user_id = query.from_user.id
 
+    # Проверяем наличие QR-кода
     async for session in get_session():
         token = await get_bot_setting(session, "payment_qr_token")
         if not token:
@@ -657,43 +809,104 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("⚠️ QR-код не задан. Загрузите его в админ‑меню.")
             else:
                 await query.edit_message_text("⚠️ Бот временно недоступен.")
+            # Удаляем PendingOrder
+            pending = await session.get(PendingOrder, user_id)
+            if pending:
+                if pending.confirmation_msg_id:
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=user_id,
+                            message_id=pending.confirmation_msg_id
+                        )
+                    except Exception:
+                        pass
+                await session.delete(pending)
+                await session.commit()
             return
         break
 
     async for session in get_session():
-        pending = await session.get(PendingOrder, user_id)
-        if pending:
-            await session.delete(pending)
-            await session.commit()
-
+        # Получаем товар с блокировкой (для избежания гонок)
         product = await session.get(Product, product_id)
         if not product or not product.is_active:
             await query.edit_message_text("❌ Товар недоступен.")
+            pending = await session.get(PendingOrder, user_id)
+            if pending:
+                if pending.confirmation_msg_id:
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=user_id,
+                            message_id=pending.confirmation_msg_id
+                        )
+                    except Exception:
+                        pass
+                await session.delete(pending)
+                await session.commit()
             context.user_data.pop('pending_order', None)
             context.user_data.pop('state', None)
             return
+
+        # Проверяем остаток
         if product.stock is not None and qty > product.stock:
-            await query.edit_message_text("❌ Недостаточно товара.")
+            # Недостаточно товара — пишем в ЛС, что доступно только X
+            await query.edit_message_text(
+                f"❌ Недостаточно товара. Доступно только {product.stock} шт.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
+                ])
+            )
+            # Удаляем PendingOrder
+            pending = await session.get(PendingOrder, user_id)
+            if pending:
+                if pending.confirmation_msg_id:
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=user_id,
+                            message_id=pending.confirmation_msg_id
+                        )
+                    except Exception:
+                        pass
+                await session.delete(pending)
+                await session.commit()
             context.user_data.pop('pending_order', None)
             context.user_data.pop('state', None)
             return
 
-        from bot.db import get_or_create_draft, add_item_to_order
-        order = await get_or_create_draft(session, user_id)
-        stmt = select(Order).where(Order.id == order.id).options(selectinload(Order.items).selectinload(OrderItem.product))
-        order = (await session.execute(stmt)).scalar_one()
-        await add_item_to_order(session, order, product, qty)
-        order = (await session.execute(stmt)).scalar_one()
-
+        # Резервируем товар: списываем остаток
         if product.stock is not None:
             product.stock -= qty
             product.is_active = product.stock > 0
             product.in_stock = product.stock > 0
+
+        # Создаём заказ из корзины
+        from bot.db import get_or_create_draft, add_item_to_order
+        order = await get_or_create_draft(session, user_id)
+        stmt = select(Order).where(Order.id == order.id).options(
+            selectinload(Order.items).selectinload(OrderItem.product)
+        )
+        order = (await session.execute(stmt)).scalar_one()
+        await add_item_to_order(session, order, product, qty)
+        order = (await session.execute(stmt)).scalar_one()
         order.status = OrderStatus.pending
         await session.commit()
-
+        invalidate_catalog_cache()
         cart_text = format_cart(order)
 
+        # Удаляем PendingOrder и сообщение с кнопками
+        pending = await session.get(PendingOrder, user_id)
+        if pending:
+            if pending.confirmation_msg_id:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=user_id,
+                        message_id=pending.confirmation_msg_id
+                    )
+                except Exception:
+                    pass
+            await session.delete(pending)
+            await session.commit()
+
+    # QR-код (вне сессии)
     qr_token = None
     async for session in get_session():
         qr_token = await get_bot_setting(session, "payment_qr_token")
@@ -734,6 +947,14 @@ async def porder_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async for session in get_session():
         pending = await session.get(PendingOrder, user_id)
         if pending:
+            if pending.confirmation_msg_id:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=user_id,
+                        message_id=pending.confirmation_msg_id
+                    )
+                except Exception:
+                    pass
             await session.delete(pending)
             await session.commit()
     context.user_data.pop('pending_order', None)
@@ -833,6 +1054,8 @@ async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await process_search_article(message, content_text, context)
     elif state == 'search_name':
         await process_search_name(message, content_text, context)
+    elif state == 'awaiting_full_name':
+        await process_awaiting_full_name(message, content_text, context)
     elif state == 'awaiting_phone':
         await process_awaiting_phone(message, content_text, context)
     elif state == 'awaiting_address':
@@ -843,6 +1066,8 @@ async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await process_admin_set_stock(message, content_text, context)
     elif state == 'admin_search_article':
         await process_admin_search_article(message, content_text, context)
+    elif state == 'admin_link_post':
+        await process_admin_link_post(message, content_text, context)
     else:
         async for session in get_session():
             stmt = select(Order).where(
@@ -898,10 +1123,21 @@ async def handle_delivery_choice(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data['data'] = {'order_id': order_id}
     await query.edit_message_text(f"✅ Выбрана доставка: {delivery_name}\n📍 Теперь введите адрес доставки:",
                                    reply_markup=kb_back_to_menu())
-
+async def contact_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки «Написать администратору»."""
+    query = update.callback_query
+    await query.answer()
+    logger.info("contact_admin_start", extra={"user_id": query.from_user.id})
+    context.user_data['state'] = 'contact_admin'
+    await query.edit_message_text("✏️ Напишите ваш вопрос администратору (текст):", reply_markup=kb_back_to_menu())
 def register(app):
+    # ВАЖНО: диспетчер FSM работает ТОЛЬКО в личке (PRIVATE). Раньше фильтр был
+    # `~ChatType.CHANNEL`, из-за чего этот хэндлер (группа 0, регистрируется
+    # раньше posts) перехватывал сообщения из группы обсуждения канала и
+    # `handle_comment` в posts.py никогда не вызывался. Ограничение приватным
+    # чатом освобождает сообщения группы обсуждения для обработчика комментариев.
     app.add_handler(MessageHandler(
-        (filters.TEXT | filters.CAPTION | filters.PHOTO | filters.VIDEO) & ~filters.ChatType.CHANNEL,
+        (filters.TEXT | filters.CAPTION | filters.PHOTO | filters.VIDEO) & filters.ChatType.PRIVATE,
         message_dispatcher
     ))
     app.add_handler(CallbackQueryHandler(handle_delivery_choice, pattern='^delivery:'))
@@ -954,3 +1190,6 @@ def register(app):
 
     app.add_handler(CallbackQueryHandler(search_page_handler, pattern='^search:page:'))
     app.add_handler(CallbackQueryHandler(search_select_handler, pattern='^search:select:'))
+    app.add_handler(CallbackQueryHandler(porder_confirm, pattern='^porder:confirm:'))
+    app.add_handler(CallbackQueryHandler(porder_cancel, pattern='^porder:cancel$'))
+    app.add_handler(CallbackQueryHandler(contact_admin_start, pattern='^contact:admin$'))

@@ -3,42 +3,37 @@ from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
 from bot.db import get_session, get_or_create_user, get_draft_order, remove_item_from_order, recalculate_total, OrderStatus
+from bot.db import Product, Order, OrderItem, get_bot_setting, invalidate_catalog_cache
 from bot.keyboards import kb_cart_actions, kb_cart_items_remove, kb_back_to_menu
 from bot.utils import format_cart
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
-from bot.db import Product, Order, OrderItem   # если используется Product (теперь да)
-from bot.db import get_session, get_bot_setting
 from bot.config import ADMIN_USER_ID
 
 logger = logging.getLogger(__name__)
 
 
 async def view_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Просмотр текущей корзины."""
+    """Просмотр текущей корзины (редактирует текущее сообщение)."""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    # Удаляем предыдущее сообщение корзины, если оно было сохранено
-    prev_msg_id = context.user_data.pop('cart_message_id', None)
-    if prev_msg_id:
-        try:
-            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=prev_msg_id)
-        except Exception:
-            pass
 
     async for session in get_session():
-        user = await get_or_create_user(session, user_id)
         order = await get_draft_order(session, user_id)
 
     if order is None or not order.items:
-        msg = await query.edit_message_text("🛒 Ваша корзина пуста.\nПерейдите в каталог и добавьте товары.",
-                                             reply_markup=kb_back_to_menu())
-    else:
-        msg = await query.edit_message_text(format_cart(order),
-                                            parse_mode=ParseMode.MARKDOWN,
-                                            reply_markup=kb_cart_actions(order.id, has_items=True))
-    context.user_data['cart_message_id'] = msg.message_id
+        await query.edit_message_text(
+            "🛒 Ваша корзина пуста.\n\nПерейдите в каталог и добавьте товары.",
+            reply_markup=kb_back_to_menu()
+        )
+        return
+
+    await query.edit_message_text(
+        format_cart(order),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb_cart_actions(order.id, has_items=True)
+    )
 
 
 async def cart_remove_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -46,13 +41,18 @@ async def cart_remove_choose(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+
     async for session in get_session():
         order = await get_draft_order(session, user_id)
+
     if not order or not order.items:
-        await query.edit_message_text("🛒 Корзина пуста.")
+        await query.edit_message_text("🛒 Корзина пуста.", reply_markup=kb_back_to_menu())
         return
-    await query.edit_message_text("Выберите позицию для удаления:",
-                                   reply_markup=kb_cart_items_remove(order))
+
+    await query.edit_message_text(
+        "Выберите позицию для удаления:",
+        reply_markup=kb_cart_items_remove(order)
+    )
 
 
 async def cart_delete_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -61,22 +61,29 @@ async def cart_delete_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     item_id = int(query.data.split(":")[-1])
     user_id = query.from_user.id
+
     async for session in get_session():
         order = await get_draft_order(session, user_id)
         if not order:
-            await query.edit_message_text("🛒 Корзина пуста.")
+            await query.edit_message_text("🛒 Корзина пуста.", reply_markup=kb_back_to_menu())
             return
+
         removed = await remove_item_from_order(session, order, item_id)
         if removed:
             await session.refresh(order)
             if order.items:
-                await query.edit_message_text("✅ Удалено.\n\n" + format_cart(order),
-                                              parse_mode=ParseMode.MARKDOWN,
-                                              reply_markup=kb_cart_actions(order.id))
+                await query.edit_message_text(
+                    "✅ Удалено.\n\n" + format_cart(order),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb_cart_actions(order.id)
+                )
             else:
-                await query.edit_message_text("✅ Удалено. Корзина пуста.", reply_markup=kb_back_to_menu())
+                await query.edit_message_text(
+                    "✅ Удалено. Корзина пуста.",
+                    reply_markup=kb_back_to_menu()
+                )
         else:
-            await query.edit_message_text("❌ Позиция не найдена.")
+            await query.edit_message_text("❌ Позиция не найдена.", reply_markup=kb_back_to_menu())
 
 
 async def cart_edit_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -84,18 +91,24 @@ async def cart_edit_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+
     async for session in get_session():
         order = await get_draft_order(session, user_id)
+
     if not order or not order.items:
-        await query.answer("Корзина пуста.", show_alert=True)
+        await query.edit_message_text("🛒 Корзина пуста.", reply_markup=kb_back_to_menu())
         return
+
     buttons = []
     for item in order.items:
         name = item.product.name if item.product else f"Товар #{item.product_id}"
         buttons.append([InlineKeyboardButton(f"{name} (x{item.quantity})", callback_data=f"cart:change_qty:{item.id}")])
     buttons.append([InlineKeyboardButton("↩️ Назад", callback_data="cart:view")])
-    await query.edit_message_text("Выберите позицию для изменения:",
-                                   reply_markup=InlineKeyboardMarkup(buttons))
+
+    await query.edit_message_text(
+        "Выберите позицию для изменения:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
 
 async def cart_change_qty_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -104,15 +117,19 @@ async def cart_change_qty_start(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     item_id = int(query.data.split(":")[-1])
     user_id = query.from_user.id
+
     async for session in get_session():
         order = await get_draft_order(session, user_id)
+
     if not order:
-        await query.answer("Корзина пуста.", show_alert=True)
+        await query.edit_message_text("🛒 Корзина пуста.", reply_markup=kb_back_to_menu())
         return
+
     item = next((i for i in order.items if i.id == item_id), None)
     if not item:
-        await query.answer("Позиция не найдена.", show_alert=True)
+        await query.edit_message_text("❌ Позиция не найдена.", reply_markup=kb_back_to_menu())
         return
+
     current_qty = item.quantity
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("-5", callback_data=f"cart:delta:{item_id}:-5"),
@@ -122,9 +139,12 @@ async def cart_change_qty_start(update: Update, context: ContextTypes.DEFAULT_TY
         [InlineKeyboardButton("🔢 Ввести число", callback_data=f"cart:input:{item_id}")],
         [InlineKeyboardButton("↩️ Назад", callback_data="cart:view")]
     ])
-    await query.edit_message_text(f"Количество: **{current_qty}**\nВыберите действие:",
-                                   parse_mode=ParseMode.MARKDOWN,
-                                   reply_markup=kb)
+
+    await query.edit_message_text(
+        f"Количество: **{current_qty}**\nВыберите действие:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb
+    )
 
 
 async def cart_delta(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -134,36 +154,46 @@ async def cart_delta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, _, item_id, delta = query.data.split(":")
     item_id, delta = int(item_id), int(delta)
     user_id = query.from_user.id
+
     async for session in get_session():
         order = await get_draft_order(session, user_id)
         if not order:
-            await query.edit_message_text("🛒 Корзина пуста.")
+            await query.edit_message_text("🛒 Корзина пуста.", reply_markup=kb_back_to_menu())
             return
+
         item = next((i for i in order.items if i.id == item_id), None)
         if not item:
-            await query.answer("Позиция не найдена.", show_alert=True)
+            await query.edit_message_text("❌ Позиция не найдена.", reply_markup=kb_back_to_menu())
             return
+
         product = item.product
         new_qty = item.quantity + delta
         if product and product.stock is not None and new_qty > product.stock:
             await query.answer(f"❌ Доступно только {product.stock} шт.", show_alert=True)
             return
+
         if new_qty <= 0:
             order.items.remove(item)
             await session.delete(item)
         else:
             item.quantity = new_qty
+
         await recalculate_total(session, order)
         await session.commit()
+
+    # После изменения показываем корзину
     async for session in get_session():
         order = await get_draft_order(session, user_id)
+
     if not order or not order.items:
         await query.edit_message_text("🛒 Корзина пуста.", reply_markup=kb_back_to_menu())
-        context.user_data.pop('state', None)
         return
-    await query.edit_message_text(format_cart(order),
-                                   parse_mode=ParseMode.MARKDOWN,
-                                   reply_markup=kb_cart_actions(order.id))
+
+    await query.edit_message_text(
+        format_cart(order),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb_cart_actions(order.id)
+    )
 
 
 async def cart_input_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -173,47 +203,37 @@ async def cart_input_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     item_id = int(query.data.split(":")[-1])
     context.user_data['state'] = 'cart_change_qty'
     context.user_data['data'] = {'item_id': item_id}
-    await query.edit_message_text("✏️ Введите новое количество (целое число):", reply_markup=kb_back_to_menu())
+
+    await query.edit_message_text(
+        "✏️ Введите новое количество (целое число):",
+        reply_markup=kb_back_to_menu()
+    )
 
 
-# ---------- НОВЫЙ ЭТАП: ПОДТВЕРЖДЕНИЕ ЗАКАЗА ----------
 async def cart_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает сводку заказа с кнопками «Подтвердить» и «Изменить»."""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
 
-    # Удаляем предыдущее сообщение корзины
-    prev_msg_id = context.user_data.pop('cart_message_id', None)
-    if prev_msg_id:
-        try:
-            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=prev_msg_id)
-        except Exception:
-            pass
-
     async for session in get_session():
         order = await get_draft_order(session, user_id)
         if not order or not order.items:
-            await query.edit_message_text("🛒 Корзина пуста.")
+            await query.edit_message_text("🛒 Корзина пуста.", reply_markup=kb_back_to_menu())
             return
 
-    # Показываем подтверждение
     cart_text = format_cart(order)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Подтвердить заказ", callback_data=f"checkout:confirm:{order.id}")],
         [InlineKeyboardButton("✏️ Изменить заказ", callback_data="cart:view")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
     ])
-    await query.message.reply_text(
+
+    await query.edit_message_text(
         f"📋 **Проверьте ваш заказ:**\n\n{cart_text}\n\nВсё верно?",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=kb
     )
-    # Удаляем сообщение, с которого был вызван checkout
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
 
 
 async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,7 +243,7 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_id = int(query.data.split(":")[-1])
     user_id = query.from_user.id
 
-    # Проверка доступности QR для ВСЕХ пользователей
+    # Проверка доступности QR
     async for session in get_session():
         token = await get_bot_setting(session, "payment_qr_token")
         if not token:
@@ -271,6 +291,7 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         order.status = OrderStatus.pending
         await session.commit()
+        invalidate_catalog_cache()
         cart_text = format_cart(order)
 
     # Получаем QR-код
@@ -278,7 +299,6 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async for session in get_session():
         qr_token = await get_bot_setting(session, "payment_qr_token")
 
-    # Текст без текстовых реквизитов
     text = (
         f"✅ **Заказ #{order.id} оформлен!**\n\n"
         f"{cart_text}\n\n"
@@ -291,6 +311,7 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     if qr_token:
+        # Отправляем новое сообщение с фото QR
         await context.bot.send_photo(
             chat_id=query.message.chat_id,
             photo=qr_token,
@@ -298,14 +319,13 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb,
             parse_mode=ParseMode.MARKDOWN
         )
+        # Удаляем предыдущее сообщение (с кнопкой подтверждения)
         try:
             await query.message.delete()
         except Exception:
             pass
     else:
-        # На всякий случай (хотя проверка выше не пропускает)
         await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-# --------------------------------------------------------
 
 
 def register(app):

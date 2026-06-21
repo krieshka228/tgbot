@@ -4,7 +4,16 @@ utils.py — Вспомогательные функции для парсинг
 
 import re
 from typing import Optional
+import logging
+from telegram import Bot as TelegramBot
+from aiomax import Bot as MaxBot
+import io
+import aiohttp
+from bot.config import settings
 
+MAX_API_BASE = "https://platform-api.max.ru"
+
+logger = logging.getLogger(__name__)
 
 def parse_quantity(text: str) -> Optional[int]:
     """Извлекает целое количество из текста (например, '3 шт', '5')."""
@@ -151,7 +160,17 @@ def format_cart(order) -> str:
 def format_order_for_admin(order) -> str:
     """Форматирует информацию о заказе для администратора. Приоритет: @username."""
     user = order.user
-    user_info = f"@{user.username}" if user and user.username else (user.full_name if user else "Без имени")
+    if user:
+        user_info = f"@{user.username}" if user.username else (user.full_name or "Без имени")
+        phone = user.phone or "не указан"
+        fio = getattr(order, "full_name", None) or (user.full_name if user else None)
+    else:
+        user_info = "Пользователь не найден"
+        phone = "не указан"
+        fio = getattr(order, "full_name", None)
+
+    fio_line = f"🪪 ФИО: {escape_markdown(fio)}\n" if fio else ""
+    address = escape_markdown(order.delivery_address) if order.delivery_address else "не указан"
     items_lines = []
     for item in order.items:
         product_name = escape_markdown(item.product.name) if item.product else f"Товар #{item.product_id}"
@@ -160,13 +179,78 @@ def format_order_for_admin(order) -> str:
     return (
         f"📦 **Заказ #{order.id}**\n"
         f"👤 Клиент: {user_info}\n"
-        f"📱 Телефон: {user.phone or 'не указан'}\n"
+        f"{fio_line}"
+        f"📱 Телефон: {phone}\n"
         f"🚚 Доставка: {order.delivery_method or 'не выбран'}\n"
-        f"📍 Адрес: {order.delivery_address or 'не указан'}\n\n"
+        f"📍 Адрес: {address}\n\n"
         f"🛒 **Товары:**\n{items_text}\n\n"
         f"💰 **Итого: {order.total_amount:.0f} ₽**"
     )
 
+async def _upload_file_to_max(file_like: io.BytesIO, file_type: str) -> str | None:
+    headers = {"Authorization": settings.max_bot_token}
+    async with aiohttp.ClientSession() as session:
+        # 1. Получаем URL для загрузки
+        async with session.post(
+            f"{MAX_API_BASE}/uploads?type={file_type}",
+            headers=headers
+        ) as resp:
+            resp_text = await resp.text()
+            logger.info(f"Ответ /uploads: status={resp.status}, body={resp_text}")
+            if resp.status != 200:
+                logger.error(f"Не удалось получить URL: {resp.status} {resp_text}")
+                return None
+            data = await resp.json()
+            upload_url = data.get("url")
+            if not upload_url:
+                logger.error("Ответ /uploads не содержит URL")
+                return None
+
+        # 2. Загружаем файл
+        file_like.seek(0)
+        form = aiohttp.FormData()
+        form.add_field("data", file_like, filename="file")
+        async with session.post(upload_url, data=form) as resp:
+            resp_text = await resp.text()
+            logger.info(f"Загрузка файла: status={resp.status}, body={resp_text}")
+            if resp.status != 200:
+                logger.error(f"Ошибка загрузки: {resp.status} {resp_text}")
+                return None
+            result = await resp.json()
+            # Извлекаем токен из вложенной структуры
+            photos = result.get("photos")
+            if photos:
+                # Берём первый попавшийся токен (обычно один)
+                for photo_id, photo_data in photos.items():
+                    token = photo_data.get("token")
+                    if token:
+                        return token
+            logger.error(f"Не удалось извлечь токен из ответа: {result}")
+            return None
+
+async def upload_photo_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
+    """Загружает фото из Telegram в Max, возвращает Max-токен."""
+    try:
+        file_obj = await tg_bot.get_file(file_id)
+        file_like = io.BytesIO()
+        await file_obj.download_to_memory(file_like)
+        file_like.seek(0)
+        return await _upload_file_to_max(file_like, "image")
+    except Exception as e:
+        logger.warning(f"Не удалось загрузить фото {file_id} в Max: {e}")
+        return None
+
+async def upload_video_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
+    """Загружает видео из Telegram в Max, возвращает Max-токен."""
+    try:
+        file_obj = await tg_bot.get_file(file_id)
+        file_like = io.BytesIO()
+        await file_obj.download_to_memory(file_like)
+        file_like.seek(0)
+        return await _upload_file_to_max(file_like, "video")
+    except Exception as e:
+        logger.warning(f"Не удалось загрузить видео {file_id} в Max: {e}")
+        return None
 
 def _parse_post_link(text: str) -> Optional[int]:
     """

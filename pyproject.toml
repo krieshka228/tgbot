@@ -1,0 +1,10 @@
+[tool.pytest.ini_options]
+# Корень проекта в PYTHONPATH, чтобы импортировался пакет `bot`.
+pythonpath = ["."]
+# Авто-режим: async-тесты не требуют декоратора @pytest.mark.asyncio.
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]

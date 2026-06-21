@@ -1,542 +1,614 @@
+"""
+handlers/catalog.py — просмотр каталога покупателем.
+
+Структура навигации (3 уровня):
+
+    🏠 Главная → 📦 Категория → 📱 Подкатегория
+
+* Категории и подкатегории — это ОДНО текстовое сообщение, которое
+  редактируется на месте (``edit_message_text``), поэтому переходы между
+  ними не плодят дубли.
+* Товары показываются медиа-карточками: каждый товар — отдельное сообщение
+  с фото/видео и подписью (HTML) и кнопкой «🛒 Заказать». По 5 товаров на
+  страницу. После карточек идёт ОДНО навигационное сообщение с «хлебными
+  крошками», счётчиком и кнопками пагинации/возврата/«🏠 Главная».
+* При переключении страницы (и при выходе из товаров) все ранее
+  отправленные карточки и навигационное сообщение удаляются через
+  ``delete_message`` перед отправкой новых — дублей не остаётся.
+
+Список товаров категории кэшируется на 60 секунд функцией
+``get_active_products_in_category`` (bot/cache.py, ``CATALOG_CACHE_TTL``),
+поэтому переключение страниц и повторные заходы не бьют по БД. Кэш
+сбрасывается при любом изменении товаров (см. CLAUDE.md).
+
+Все callback-хэндлеры обёрнуты в ``@catalog_handler`` (try/except +
+``logger.exception`` + мягкий ответ пользователю), чтобы интерфейс не
+«зависал» при сбое.
+"""
+
+import asyncio
+import functools
+import html
 import logging
-from urllib.parse import quote, unquote
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo
-from telegram.ext import ContextTypes, CallbackQueryHandler
+from collections import Counter
+
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
-from sqlalchemy import select, func
-from bot.db import get_session, Product, get_or_create_user, get_or_create_draft, add_item_to_order, Order, OrderItem
-from sqlalchemy.orm import selectinload
-from bot.keyboards import kb_cart_actions, kb_back_to_menu
-from bot.utils import format_cart, parse_quantity, escape_markdown
+from telegram.ext import CallbackQueryHandler, ContextTypes
+
 from bot.config import ADMIN_USER_ID
-from bot.db import get_bot_setting
+from bot.db import (
+    Product,
+    get_active_products_in_category,
+    get_all_active_products,
+    get_bot_setting,
+    get_session,
+)
+from bot.keyboards import kb_back_to_menu
 
 logger = logging.getLogger(__name__)
-ITEMS_PER_PAGE = 3
 
-_catalog_messages: dict[int, list[str]] = {}
+# Товары — медиа-карточками, поэтому страница небольшая (флуд-лимиты Telegram).
+PRODUCTS_PER_PAGE = 3
+# Категории/подкатегории — кнопки в столбик.
+LIST_PER_PAGE = 8
+
+HOME_BUTTON = InlineKeyboardButton("🏠 Главная", callback_data="menu:main")
 
 
-async def delete_catalog_messages(user_id: int, bot, also_delete_message_id: str | None = None):
-    ids_to_delete = _catalog_messages.pop(user_id, [])[:]
-    if also_delete_message_id and also_delete_message_id not in ids_to_delete:
-        ids_to_delete.append(also_delete_message_id)
-    for mid in ids_to_delete:
+# ============================ ИНФРАСТРУКТУРА ============================
+
+def catalog_handler(func):
+    """Декоратор: единый try/except + ``logger.exception`` для хэндлеров.
+
+    Любое исключение логируется с трейсбеком, а пользователю показывается
+    мягкое уведомление вместо «зависшей» кнопки.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        # Хэндлеры вызываются и как (update, context), и как (query, context, page=…)
+        # — пробрасываем аргументы как есть, а объект callback'а для
+        # логирования/ответа определяем из первого аргумента.
         try:
-            await bot.delete_message(mid)
-        except Exception:
+            return await func(*args, **kwargs)
+        except Exception:  # noqa: BLE001 — намеренно ловим всё на границе хэндлера
+            obj = args[0] if args else None
+            query = getattr(obj, "callback_query", None) or obj
+            logger.exception(
+                "catalog handler failed",
+                extra={"event": "catalog_error",
+                       "handler": func.__name__,
+                       "callback": getattr(query, "data", None),
+                       "user_id": getattr(getattr(query, "from_user", None), "id", None)},
+            )
+            if query is not None and hasattr(query, "answer"):
+                try:
+                    await query.answer("⚠️ Произошла ошибка, попробуйте позже.",
+                                       show_alert=True)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    return wrapper
+
+
+async def _safe_answer(query, text: str | None = None, *, show_alert: bool = False) -> None:
+    """Отвечает на callback, не падая при повторном/просроченном ответе."""
+    try:
+        await query.answer(text, show_alert=show_alert)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _crumbs(category: str | None = None, subcategory: str | None = None) -> str:
+    """«Хлебные крошки» (HTML): 🏠 Главная → 📦 Категория → 📱 Подкатегория.
+
+    Текущий (последний) уровень выделяется жирным.
+    """
+    parts = ["🏠 Главная"]
+    if category:
+        parts.append(f"📦 {html.escape(category)}")
+    if subcategory:
+        parts.append(f"📱 {html.escape(subcategory)}")
+    parts[-1] = f"<b>{parts[-1]}</b>"
+    return " → ".join(parts)
+
+
+def _pagination_row(page: int, total_pages: int, prefix: str) -> list[list]:
+    """Строка пагинации ◀️/▶️ (или пустой список, если страница одна)."""
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("◀️ Назад", callback_data=f"{prefix}:{page - 1}"))
+    if page < total_pages - 1:
+        row.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"{prefix}:{page + 1}"))
+    return [row] if row else []
+
+
+def _subcategory_of(product: Product) -> str:
+    """Подкатегория = часть названия до первой запятой (как в исходной логике)."""
+    name = product.name or ""
+    return name.split(",")[0].strip() if "," in name else name.strip()
+
+
+async def _render_list(query, context, text: str, keyboard: list[list]) -> None:
+    """Показывает текстовый экран-список, редактируя текущее сообщение.
+
+    Если редактирование невозможно (текущее сообщение — медиа), сообщение
+    удаляется и отправляется новое — гарантируем ровно одно сообщение.
+    """
+    markup = InlineKeyboardMarkup(keyboard)
+    try:
+        await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    except Exception:
+        try:
+            await query.message.delete()
+        except Exception:  # noqa: BLE001
             pass
+        await context.bot.send_message(
+            chat_id=query.message.chat_id, text=text,
+            reply_markup=markup, parse_mode=ParseMode.HTML,
+        )
 
 
-# ================== УРОВЕНЬ 1: категории ==================
-async def catalog_show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+async def _safe_delete(bot, chat_id: int, message_id: int) -> None:
+    """Удаляет сообщение, гася ошибки (уже удалено / нет прав / устарело)."""
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _clear_product_messages(query, context, *, keep_current: bool = True) -> None:
+    """Удаляет карточки товаров и навигационное сообщение ОДНОВРЕМЕННО.
+
+    Удаление идёт параллельно через ``asyncio.gather`` — это заметно быстрее
+    последовательного при 5 карточках на странице.
+
+    :param keep_current: не удалять ``query.message`` (его отредактируют выше
+        — например, при возврате к категориям навигационное сообщение
+        превращается в список категорий редактированием на месте).
+    """
+    bot = context.bot
+    chat_id = query.message.chat_id
+    ids = list(context.user_data.pop("catalog_product_msgs", []))
+    nav = context.user_data.pop("catalog_nav_msg_id", None)
+    if nav is not None:
+        ids.append(nav)
+    to_delete = [mid for mid in ids
+                 if not (keep_current and mid == query.message.message_id)]
+    if to_delete:
+        await asyncio.gather(*[_safe_delete(bot, chat_id, mid) for mid in to_delete])
+
+
+# ========================= УРОВЕНЬ 1: КАТЕГОРИИ =========================
+
+@catalog_handler
+async def catalog_show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                  page: int = 0):
+    """Список категорий с количеством активных товаров в каждой."""
     query = update.callback_query
-    await query.answer()
-
-    # Удаляем старые сообщения каталога (товары и навигацию), но НЕ сообщение с категориями
-    for msg_id in context.user_data.pop('catalog_product_msgs', []):
-        try:
-            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_id)
-        except Exception:
-            pass
+    await _safe_answer(query)
+    # Если пришли из товаров — убираем карточки, текущее сообщение редактируем.
+    await _clear_product_messages(query, context, keep_current=True)
+    context.user_data.pop("catalog_current_sub", None)
 
     async for session in get_session():
-        all_categories = (await session.execute(
-            select(Product.category).where(Product.is_active == True, Product.category != None).distinct().order_by(Product.category)
-        )).scalars().all()
+        products = await get_all_active_products(session)
 
-    if not all_categories:
-        await query.edit_message_text("📭 В каталоге пока нет категорий.", reply_markup=kb_back_to_menu())
+    counts = Counter(p.category for p in products if p.category)
+    if not counts:
+        await _render_list(query, context, "📭 В каталоге пока нет товаров.",
+                           [[HOME_BUTTON]])
         return
 
-    total = len(all_categories)
-    total_pages = (total - 1) // ITEMS_PER_PAGE + 1
-    start = page * ITEMS_PER_PAGE
-    end = start + ITEMS_PER_PAGE
-    page_categories = all_categories[start:end]
+    categories = sorted(counts)
+    total_pages = (len(categories) - 1) // LIST_PER_PAGE + 1
+    page = max(0, min(page, total_pages - 1))
+    page_cats = categories[page * LIST_PER_PAGE: page * LIST_PER_PAGE + LIST_PER_PAGE]
 
-    context.user_data['catalog_cats'] = {idx: cat for idx, cat in enumerate(page_categories)}
+    # Маппинг индекс→категория (в callback_data нельзя класть произвольный текст).
+    context.user_data["catalog_cats"] = dict(enumerate(page_cats))
 
-    kb = []
-    for idx, cat in enumerate(page_categories):
-        kb.append([InlineKeyboardButton(cat, callback_data=f"catalog:sc:{idx}")])
+    keyboard = [
+        [InlineKeyboardButton(f"📦 {cat} ({counts[cat]})", callback_data=f"catalog:sc:{idx}")]
+        for idx, cat in enumerate(page_cats)
+    ]
+    keyboard += _pagination_row(page, total_pages, "catalog:catlist")
+    keyboard.append([HOME_BUTTON])
 
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("← Назад", callback_data=f"catalog:catlist:{page-1}"))
-    if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Вперёд →", callback_data=f"catalog:catlist:{page+1}"))
-    if nav_buttons:
-        kb.append(nav_buttons)
-    kb.append([InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")])
-
-    nav_text = f"**Категории** (стр. {page+1}/{total_pages})"
-    try:
-        await query.edit_message_text(nav_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-    except Exception:
-        # Если редактирование не удалось, отправляем новое
-        msg = await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=nav_text,
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        context.user_data['catalog_nav_msg_id'] = msg.message_id
+    header = f"{_crumbs()}\n📂 <b>Категории</b> · стр. {page + 1}/{total_pages}"
+    logger.info("catalog: categories", extra={"event": "catalog_categories",
+                                               "user_id": query.from_user.id, "page": page})
+    await _render_list(query, context, header, keyboard)
 
 
-# ================== УРОВЕНЬ 2: подкатегории ==================
-async def catalog_show_subcategories(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+# ======================= УРОВЕНЬ 2: ПОДКАТЕГОРИИ ========================
+
+@catalog_handler
+async def catalog_show_subcategories(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                     page: int = 0):
+    """Подкатегории выбранной категории с количеством товаров."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
+    await _clear_product_messages(query, context, keep_current=True)
 
-    category = context.user_data.get('catalog_current_cat')
+    category = context.user_data.get("catalog_current_cat")
     if not category:
         await catalog_show_categories(update, context)
         return
 
-    # Удаляем старые товары, но не сообщение подкатегорий
-    for msg_id in context.user_data.pop('catalog_product_msgs', []):
-        try:
-            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_id)
-        except Exception:
-            pass
-
     async for session in get_session():
-        products = (await session.execute(
-            select(Product).where(Product.is_active == True, Product.category == category)
-        )).scalars().all()
+        products = await get_active_products_in_category(session, category)
 
-    subcategories = {}
-    for p in products:
-        if ',' in p.name:
-            sub = p.name.split(',')[0].strip()
-        else:
-            sub = p.name.strip()
-        subcategories[sub] = subcategories.get(sub, 0) + 1
-
-    if not subcategories:
-        await query.edit_message_text(f"В категории «{category}» пока нет товаров.", reply_markup=kb_back_to_menu())
-        return
-
-    all_subs = sorted(subcategories.keys())
-    total = len(all_subs)
-    total_pages = (total - 1) // ITEMS_PER_PAGE + 1
-    start = page * ITEMS_PER_PAGE
-    end = start + ITEMS_PER_PAGE
-    page_subs = all_subs[start:end]
-
-    context.user_data['catalog_subs'] = {idx: sub for idx, sub in enumerate(page_subs)}
-
-    kb = []
-    for idx, sub in enumerate(page_subs):
-        kb.append([InlineKeyboardButton(sub, callback_data=f"catalog:ss:{idx}")])
-
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("← Назад", callback_data=f"catalog:sublist:{page-1}"))
-    if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Вперёд →", callback_data=f"catalog:sublist:{page+1}"))
-    if nav_buttons:
-        kb.append(nav_buttons)
-    kb.append([InlineKeyboardButton("↩️ К категориям", callback_data="catalog:show")])
-    kb.append([InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")])
-
-    nav_text = f"**{category}** — выберите подкатегорию:"
-    try:
-        await query.edit_message_text(nav_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-    except Exception:
-        msg = await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=nav_text,
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode=ParseMode.MARKDOWN
+    counts = Counter(_subcategory_of(p) for p in products)
+    if not counts:
+        await _render_list(
+            query, context,
+            f"{_crumbs(category)}\n\nВ этой категории пока нет товаров 😔",
+            [[InlineKeyboardButton("↩️ К категориям", callback_data="catalog:show")],
+             [HOME_BUTTON]],
         )
-        context.user_data['catalog_nav_msg_id'] = msg.message_id
+        return
+
+    subs = sorted(counts)
+    total_pages = (len(subs) - 1) // LIST_PER_PAGE + 1
+    page = max(0, min(page, total_pages - 1))
+    page_subs = subs[page * LIST_PER_PAGE: page * LIST_PER_PAGE + LIST_PER_PAGE]
+
+    context.user_data["catalog_subs"] = dict(enumerate(page_subs))
+
+    keyboard = [
+        [InlineKeyboardButton(f"📱 {sub} ({counts[sub]})", callback_data=f"catalog:ss:{idx}")]
+        for idx, sub in enumerate(page_subs)
+    ]
+    keyboard += _pagination_row(page, total_pages, "catalog:sublist")
+    keyboard.append([InlineKeyboardButton("↩️ К категориям", callback_data="catalog:show")])
+    keyboard.append([HOME_BUTTON])
+
+    header = f"{_crumbs(category)}\nВыберите подкатегорию (стр. {page + 1}/{total_pages}):"
+    logger.info("catalog: subcategories", extra={"event": "catalog_subcategories",
+                                                  "user_id": query.from_user.id,
+                                                  "category": category, "page": page})
+    await _render_list(query, context, header, keyboard)
 
 
-# ================== ТОВАРЫ ==================
+# =================== УРОВЕНЬ 3: ТОВАРЫ (МЕДИА-КАРТОЧКИ) ==================
+
+def _product_caption(product: Product) -> str:
+    """HTML-подпись карточки: жирный заголовок, разделители ▫️, цена, описание."""
+    lines = [f"<b>{html.escape(product.name or 'Без названия')}</b>"]
+    if product.article:
+        lines.append(f"▫️ Артикул: <code>{html.escape(product.article)}</code>")
+    if product.stock is not None:
+        lines.append(f"▫️ На складе: {product.stock} шт.")
+    lines.append(f"▫️ Цена: <b>{product.price:.0f} ₽</b>")
+    if product.description:
+        lines.append("")
+        lines.append(html.escape(product.description))
+    return "\n".join(lines)
+
+
+async def _send_product_card(bot, chat_id: int, product: Product) -> list[int]:
+    """Отправляет карточку товара ОДНИМ сообщением (фото/видео + подпись).
+
+    Баг 4: фото и описание шлём вместе (``caption``), а не двумя сообщениями —
+    иначе при параллельной отправке текст и фото могли приходить вразнобой.
+    При нескольких фото берём первое (одно сообщение гарантирует порядок и
+    привязку кнопки «Заказать»). Возвращает список id (всегда из одного элемента).
+    """
+    caption = _product_caption(product)
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🛒 Заказать", callback_data=f"order:start:{product.id}")]]
+    )
+    photos = product.photo_file_ids.split(",") if product.photo_file_ids else []
+    videos = product.video_file_ids.split(",") if product.video_file_ids else []
+
+    try:
+        if photos:
+            m = await bot.send_photo(chat_id, photo=photos[0], caption=caption,
+                                     reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        elif videos:
+            m = await bot.send_video(chat_id, video=videos[0], caption=caption,
+                                     reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        else:
+            m = await bot.send_message(chat_id, text=caption, reply_markup=keyboard,
+                                       parse_mode=ParseMode.HTML)
+        return [m.message_id]
+    except Exception as exc:  # noqa: BLE001 — деградируем до текста при сбое медиа
+        logger.warning("product card send failed",
+                       extra={"event": "media_error", "product_id": product.id,
+                              "error": repr(exc)})
+        m = await bot.send_message(chat_id, text=caption, reply_markup=keyboard,
+                                   parse_mode=ParseMode.HTML)
+        return [m.message_id]
+
+
+@catalog_handler
 async def show_products_page(query, context, page: int = 0):
-    """Показывает товары внутри выбранной подкатегории (данные берутся из user_data)."""
-    category = context.user_data.get('catalog_current_cat')
-    subcategory = context.user_data.get('catalog_current_sub')
-    if not category:
-        await query.edit_message_text("Сначала выберите категорию.", reply_markup=kb_back_to_menu())
-        return
-
-    async for session in get_session():
-        stmt = select(Product).where(Product.is_active == True, Product.category == category)
-        if subcategory:
-            stmt = stmt.where(
-                (Product.name == subcategory) |
-                (Product.name.startswith(subcategory + ','))
-            )
-        total = (await session.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
-        products = (await session.execute(
-            stmt.order_by(Product.id).offset(page * ITEMS_PER_PAGE).limit(ITEMS_PER_PAGE)
-        )).scalars().all()
-
-    if not products:
-        await query.edit_message_text(f"Товары не найдены.", reply_markup=kb_back_to_menu())
-        return
-
-    # Удаляем старые карточки товаров, но не навигационное сообщение
-    for msg_id in context.user_data.pop('catalog_product_msgs', []):
-        try:
-            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_id)
-        except Exception:
-            pass
-
-    new_msgs = []
+    """Показывает страницу товаров медиа-карточками (3/стр.) + навигацию."""
+    await _safe_answer(query, "⏳ Загрузка...")
+    # Возврат к списку отменяет незавершённый ввод количества (state order_qty).
+    context.user_data.pop("state", None)
     chat_id = query.message.chat_id
     bot = context.bot
 
-    for product in products:
-        name = escape_markdown(product.name)
-        article = escape_markdown(product.article) if product.article else None
-        text = name
-        if article:
-            text += f"\nАртикул {article}"
-        if product.stock is not None:
-            text += f"\nНа складе: {product.stock}"
-        text += f"\n\nЦена {product.price:.0f} ₽"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Заказать", callback_data=f"order:start:{product.id}")]])
+    category = context.user_data.get("catalog_current_cat")
+    subcategory = context.user_data.get("catalog_current_sub")
 
-        photos = product.photo_file_ids.split(',') if product.photo_file_ids else []
-        videos = product.video_file_ids.split(',') if product.video_file_ids else []
+    back_btn = (
+        InlineKeyboardButton("↩️ К подкатегориям", callback_data="catalog:back_to_subs")
+        if subcategory else
+        InlineKeyboardButton("↩️ К категориям", callback_data="catalog:show")
+    )
 
-        try:
-            if len(photos) == 1 and not videos:
-                msg = await bot.send_photo(chat_id=chat_id, photo=photos[0], caption=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-                new_msgs.append(msg.message_id)
-            elif len(videos) == 1 and not photos:
-                msg = await bot.send_video(chat_id=chat_id, video=videos[0], caption=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-                new_msgs.append(msg.message_id)
-            elif photos or videos:
-                media = []
-                for idx, fid in enumerate(photos):
-                    if idx == 0 and not videos:
-                        media.append(InputMediaPhoto(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
-                    else:
-                        media.append(InputMediaPhoto(media=fid))
-                for idx, fid in enumerate(videos):
-                    if idx == 0 and not photos:
-                        media.append(InputMediaVideo(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
-                    else:
-                        media.append(InputMediaVideo(media=fid))
-                if photos and videos:
-                    media[0] = InputMediaPhoto(media=photos[0], caption=text, parse_mode=ParseMode.MARKDOWN)
-                msgs = await bot.send_media_group(chat_id=chat_id, media=media)
-                for m in msgs:
-                    new_msgs.append(m.message_id)
-                btn_msg = await bot.send_message(chat_id=chat_id, text="Выберите действие:", reply_markup=kb)
-                new_msgs.append(btn_msg.message_id)
-            else:
-                msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-                new_msgs.append(msg.message_id)
-        except Exception as e:
-            logger.warning(f"Ошибка отправки медиа для товара {product.id}: {e}")
-            msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-            new_msgs.append(msg.message_id)
+    # Чистим прошлые карточки/навигацию и сообщение, с которого пришли (список
+    # подкатегорий или старую навигацию) — чтобы новые карточки шли «с чистого листа».
+    await _clear_product_messages(query, context, keep_current=False)
+    try:
+        await query.message.delete()
+    except Exception:  # noqa: BLE001
+        pass
 
-    context.user_data['catalog_product_msgs'] = new_msgs
+    if not category:
+        msg = await bot.send_message(
+            chat_id, "Сначала выберите категорию.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("↩️ К категориям", callback_data="catalog:show")]]),
+        )
+        context.user_data["catalog_nav_msg_id"] = msg.message_id
+        return
 
-    # Навигационное сообщение (редактируем предыдущее или отправляем новое)
-    total_pages = (total - 1) // ITEMS_PER_PAGE + 1
-    nav_text = f"**{category} / {subcategory or 'все'}** (стр. {page+1}/{total_pages})"
-    nav_kb = []
-    if page > 0:
-        nav_kb.append(InlineKeyboardButton("← Назад", callback_data=f"catalog:prodpage:{page-1}"))
-    if page < total_pages - 1:
-        nav_kb.append(InlineKeyboardButton("Вперёд →", callback_data=f"catalog:prodpage:{page+1}"))
-    kb_nav = []
-    if nav_kb:
-        kb_nav.append(nav_kb)
-    if subcategory:
-        kb_nav.append([InlineKeyboardButton("↩️ К подкатегориям", callback_data="catalog:back_to_subs")])
-    else:
-        kb_nav.append([InlineKeyboardButton("↩️ К категориям", callback_data="catalog:show")])
-    kb_nav.append([InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")])
-
-    prev_nav_msg_id = context.user_data.get('catalog_nav_msg_id')
-    if prev_nav_msg_id:
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=prev_nav_msg_id,
-                text=nav_text,
-                reply_markup=InlineKeyboardMarkup(kb_nav),
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception:
-            msg = await bot.send_message(chat_id=chat_id, text=nav_text, reply_markup=InlineKeyboardMarkup(kb_nav), parse_mode=ParseMode.MARKDOWN)
-            context.user_data['catalog_nav_msg_id'] = msg.message_id
-    else:
-        msg = await bot.send_message(chat_id=chat_id, text=nav_text, reply_markup=InlineKeyboardMarkup(kb_nav), parse_mode=ParseMode.MARKDOWN)
-        context.user_data['catalog_nav_msg_id'] = msg.message_id
-
-    # Больше не удаляем текущее сообщение – оно теперь является навигационным
-
-
-# ================== ЗАКАЗ ==================
-async def start_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    # Первый ответ обязателен для Telegram
-    await query.answer()
-
-    logger.info("start_order вызван!")
-
-    # Проверка доступности QR для ВСЕХ пользователей
     async for session in get_session():
-        token = await get_bot_setting(session, "payment_qr_token")
-        logger.info(f"QR token: {token}")
-        if not token:
-            if query.from_user.id == ADMIN_USER_ID:
-                await query.answer("⚠️ QR-код не задан. Загрузите его в админ‑меню.", show_alert=True)
-            else:
-                await query.answer("⚠️ Бот временно недоступен.", show_alert=True)
-            return
-        break   # токен есть
+        all_products = await get_active_products_in_category(session, category)
 
-    product_id = int(query.data.split(":")[-1])
-    logger.info(f"product_id={product_id}")
+    if subcategory:
+        products_all = [p for p in all_products
+                        if p.name == subcategory or p.name.startswith(subcategory + ",")]
+    else:
+        products_all = all_products
 
+    # Пустая категория/подкатегория — одно сообщение с кнопкой «Назад».
+    if not products_all:
+        msg = await bot.send_message(
+            chat_id,
+            f"{_crumbs(category, subcategory)}\n\nВ этой категории пока нет товаров 😔",
+            reply_markup=InlineKeyboardMarkup([[back_btn], [HOME_BUTTON]]),
+            parse_mode=ParseMode.HTML,
+        )
+        context.user_data["catalog_nav_msg_id"] = msg.message_id
+        logger.info("catalog: empty products", extra={"event": "catalog_products_empty",
+                                                       "user_id": query.from_user.id,
+                                                       "category": category,
+                                                       "subcategory": subcategory})
+        return
+
+    total = len(products_all)
+    total_pages = (total - 1) // PRODUCTS_PER_PAGE + 1
+    page = max(0, min(page, total_pages - 1))
+    context.user_data["catalog_prod_page"] = page
+    page_products = products_all[page * PRODUCTS_PER_PAGE:
+                                 page * PRODUCTS_PER_PAGE + PRODUCTS_PER_PAGE]
+
+    # 1) Карточки товаров отправляются ПАРАЛЛЕЛЬНО (asyncio.gather) с небольшим
+    # сдвигом старта (~0.06 с между запусками), чтобы перекрыть сетевые задержки
+    # и при этом не упереться во флуд-лимиты Telegram. gather сохраняет порядок
+    # результатов = порядок товаров, поэтому id карточек собираются по порядку.
+    async def _send_staggered(index: int, product: Product) -> list[int]:
+        await asyncio.sleep(0.06 * index)
+        return await _send_product_card(bot, chat_id, product)
+
+    results = await asyncio.gather(
+        *[_send_staggered(i, p) for i, p in enumerate(page_products)]
+    )
+    new_msgs = [mid for sub in results for mid in sub]
+    context.user_data["catalog_product_msgs"] = new_msgs
+
+    # 2) Навигационное сообщение под карточками: крошки, счётчик, пагинация.
+    nav_text = (f"{_crumbs(category, subcategory)}\n"
+                f"🔎 Найдено {total} товаров. Страница {page + 1} из {total_pages}")
+    nav_kb = _pagination_row(page, total_pages, "catalog:prodpage")
+    nav_kb.append([back_btn])
+    nav_kb.append([HOME_BUTTON])
+    nav_msg = await bot.send_message(chat_id, nav_text,
+                                     reply_markup=InlineKeyboardMarkup(nav_kb),
+                                     parse_mode=ParseMode.HTML)
+    context.user_data["catalog_nav_msg_id"] = nav_msg.message_id
+
+    logger.info("catalog: products page", extra={"event": "catalog_products",
+                                                 "user_id": query.from_user.id,
+                                                 "category": category,
+                                                 "subcategory": subcategory,
+                                                 "page": page, "total": total})
+
+    # 3) Префетч следующей страницы в фоне: прогреваем 60-секундный TTL-кэш
+    # списка товаров категории, чтобы переход «Вперёд ▶️» был мгновенным.
+    # (Весь список категории кэшируется одним вызовом, поэтому это и есть
+    # данные следующей страницы.)
+    if page + 1 < total_pages:
+        asyncio.create_task(_prefetch_category(category))
+
+
+async def _prefetch_category(category: str) -> None:
+    """Фоновый прогрев кэша списка товаров категории (для следующей страницы)."""
     try:
         async for session in get_session():
-            product = await session.get(Product, product_id)
-            break
-        if not product or not product.is_active:
-            logger.warning(f"Товар не найден или неактивен: {product_id}")
-            await query.answer("Товар недоступен.", show_alert=True)
-            return
+            await get_active_products_in_category(session, category)
+    except Exception:  # noqa: BLE001 — фоновая задача не должна влиять на UX
+        logger.debug("prefetch failed", extra={"category": category})
 
-        logger.info("Товар найден, удаляю сообщение...")
-        await query.message.delete()
 
-        # Экранирование
-        name = escape_markdown(product.name)
-        article = escape_markdown(product.article) if product.article else None
-        text = name
-        if article:
-            text += f"\nАртикул {article}"
-        if product.stock is not None:
-            text += f"\nНа складе: {product.stock}"
-        text += f"\n\nЦена {product.price:.0f} ₽\n\n✏️ Введите количество:"
+# ============================== ЗАКАЗ ==================================
 
-        photos = product.photo_file_ids.split(',') if product.photo_file_ids else []
-        videos = product.video_file_ids.split(',') if product.video_file_ids else []
+@catalog_handler
+async def start_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «Заказать» из карточки — запрашивает количество."""
+    query = update.callback_query
+    await _safe_answer(query)
 
-        card_msg_id = None
-        try:
-            if len(photos) == 1 and not videos:
-                msg = await query.message.reply_photo(
-                    photo=photos[0],
-                    caption=text,
-                    reply_markup=kb_back_to_menu(),
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                card_msg_id = msg.message_id
-            elif len(videos) == 1 and not photos:
-                msg = await query.message.reply_video(
-                    video=videos[0],
-                    caption=text,
-                    reply_markup=kb_back_to_menu(),
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                card_msg_id = msg.message_id
-            elif photos or videos:
-                media = []
-                for idx, fid in enumerate(photos):
-                    if idx == 0 and not videos:
-                        media.append(InputMediaPhoto(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
-                    else:
-                        media.append(InputMediaPhoto(media=fid))
-                for idx, fid in enumerate(videos):
-                    if idx == 0 and not photos:
-                        media.append(InputMediaVideo(media=fid, caption=text, parse_mode=ParseMode.MARKDOWN))
-                    else:
-                        media.append(InputMediaVideo(media=fid))
-                if photos and videos:
-                    media[0] = InputMediaPhoto(media=photos[0], caption=text, parse_mode=ParseMode.MARKDOWN)
-                msgs = await query.message.reply_media_group(media=media)
-                btn_msg = await query.message.reply_text("Выберите действие:", reply_markup=kb_back_to_menu())
-                card_msg_id = btn_msg.message_id
+    # Доступность реквизитов (QR) — без них оформление невозможно.
+    async for session in get_session():
+        token = await get_bot_setting(session, "payment_qr_token")
+        if not token:
+            if query.from_user.id == ADMIN_USER_ID:
+                await _safe_answer(query, "⚠️ QR-код не задан. Загрузите его в админ‑меню.",
+                                   show_alert=True)
             else:
-                msg = await query.message.reply_text(text, reply_markup=kb_back_to_menu(), parse_mode=ParseMode.MARKDOWN)
-                card_msg_id = msg.message_id
-        except Exception as e:
-            logger.error(f"Ошибка отправки медиа: {e}", exc_info=True)
-            msg = await query.message.reply_text(text, reply_markup=kb_back_to_menu(), parse_mode=ParseMode.MARKDOWN)
-            card_msg_id = msg.message_id
+                await _safe_answer(query, "⚠️ Бот временно недоступен.", show_alert=True)
+            return
+        break
 
-        context.user_data['state'] = 'order_qty'
-        context.user_data['data'] = {'product_id': product_id, 'card_msg_id': card_msg_id}
-        logger.info("Запрос количества отправлен")
+    product_id = int(query.data.split(":")[-1])
+    async for session in get_session():
+        product = await session.get(Product, product_id)
+        break
+    if not product or not product.is_active:
+        await _safe_answer(query, "Товар недоступен.", show_alert=True)
+        return
 
-    except Exception as e:
-        logger.error(f"Ошибка в start_order: {e}", exc_info=True)
-        await query.answer("Произошла ошибка. Попробуйте позже.", show_alert=True)
+    # Закрываем все карточки текущей страницы + навигацию.
+    chat_id = query.message.chat_id
+    await _clear_product_messages(query, context, keep_current=False)
+    try:
+        await query.message.delete()
+    except Exception:  # noqa: BLE001
+        pass
+
+    text = _product_caption(product) + "\n\n✏️ Введите количество:"
+    photos = product.photo_file_ids.split(",") if product.photo_file_ids else []
+    videos = product.video_file_ids.split(",") if product.video_file_ids else []
+
+    # Кнопка «Назад к списку» возвращает на текущую страницу каталога (Баг 3).
+    back_page = context.user_data.get("catalog_prod_page", 0)
+    order_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ К списку", callback_data=f"catalog:prodpage:{back_page}")],
+        [HOME_BUTTON],
+    ])
+
+    card_msg_id = None
+    try:
+        if photos:
+            m = await context.bot.send_photo(chat_id, photo=photos[0], caption=text,
+                                             reply_markup=order_kb, parse_mode=ParseMode.HTML)
+            card_msg_id = m.message_id
+        elif videos:
+            m = await context.bot.send_video(chat_id, video=videos[0], caption=text,
+                                             reply_markup=order_kb, parse_mode=ParseMode.HTML)
+            card_msg_id = m.message_id
+        else:
+            m = await context.bot.send_message(chat_id, text=text,
+                                               reply_markup=order_kb, parse_mode=ParseMode.HTML)
+            card_msg_id = m.message_id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("order prompt media failed",
+                       extra={"event": "media_error", "product_id": product.id,
+                              "error": repr(exc)})
+        m = await context.bot.send_message(chat_id, text=text,
+                                           reply_markup=order_kb, parse_mode=ParseMode.HTML)
+        card_msg_id = m.message_id
+
+    context.user_data["state"] = "order_qty"
+    context.user_data["data"] = {"product_id": product_id, "card_msg_id": card_msg_id}
+    logger.info("catalog: order started", extra={"event": "order_start",
+                                                 "user_id": query.from_user.id,
+                                                 "product_id": product.id})
 
 
-# ================== ПОИСК ПО НАЗВАНИЮ ==================
+# ========================== ПОИСК (входы) =============================
+
+@catalog_handler
 async def search_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    context.user_data['state'] = 'search_name'
-    await query.edit_message_text("🔎 Введите название товара (или его часть):", reply_markup=kb_back_to_menu())
-
-async def search_name_result(message, text, context):
-    if not text.strip():
-        await message.reply_text("❌ Введите название для поиска.", reply_markup=kb_back_to_menu())
-        return True
-    search_term = f"%{text.strip().lower()}%"
-    async for session in get_session():
-        products = (await session.execute(
-            select(Product).where(Product.is_active == True, func.lower(Product.name).like(search_term))
-        )).scalars().all()
-
-    if not products:
-        await message.reply_text("🔎 Товары не найдены. Введите другой запрос или нажмите «Назад».", reply_markup=kb_back_to_menu())
-        return True
-
-    new_msgs = []
-    for product in products:
-        name = escape_markdown(product.name)
-        article = escape_markdown(product.article) if product.article else None
-        msg_text = name
-        if article:
-            msg_text += f"\nАртикул {article}"
-        if product.stock is not None:
-            msg_text += f"\nНа складе: {product.stock}"
-        msg_text += f"\n\nЦена {product.price:.0f} ₽"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Заказать", callback_data=f"order:start:{product.id}")]])
-        try:
-            if product.photo_file_ids:
-                photo = product.photo_file_ids.split(',')[0]
-                await message.reply_photo(photo=photo, caption=msg_text, reply_markup=kb, parse_mode="Markdown")
-            else:
-                await message.reply_text(msg_text, reply_markup=kb, parse_mode="Markdown")
-        except Exception:
-            await message.reply_text(msg_text, reply_markup=kb, parse_mode="Markdown")
-    context.user_data['search_results'] = new_msgs
-    return True
+    await _safe_answer(query)
+    context.user_data["state"] = "search_name"
+    await query.edit_message_text("🔎 Введите название товара (или его часть):",
+                                  reply_markup=kb_back_to_menu())
 
 
-# ================== ПОИСК ПО АРТИКУЛУ ==================
+@catalog_handler
 async def search_article_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    context.user_data['state'] = 'search_article'
+    await _safe_answer(query)
+    context.user_data["state"] = "search_article"
     await query.edit_message_text("🔎 Введите артикул:", reply_markup=kb_back_to_menu())
 
-async def search_article_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('state') != 'search_article':
+
+# ========================== РЕГИСТРАЦИЯ ===============================
+
+def _page_arg(update: Update) -> int:
+    """Достаёт номер страницы из callback_data вида '...:<page>'."""
+    return int(update.callback_query.data.split(":")[-1])
+
+
+@catalog_handler
+async def _select_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    idx = int(query.data.split(":")[2])
+    category = context.user_data.get("catalog_cats", {}).get(idx)
+    if not category:
+        await _safe_answer(query, "Категория не найдена, обновите каталог.", show_alert=True)
+        await catalog_show_categories(update, context)
         return
-    message = update.message
-    article_input = message.text.strip()
-    if not article_input:
-        await message.reply_text("❌ Введите артикул.", reply_markup=kb_back_to_menu())
+    context.user_data["catalog_current_cat"] = category
+    context.user_data.pop("catalog_current_sub", None)
+    await catalog_show_subcategories(update, context, page=0)
+
+
+@catalog_handler
+async def _select_subcategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    idx = int(query.data.split(":")[2])
+    subcategory = context.user_data.get("catalog_subs", {}).get(idx)
+    if not subcategory:
+        await _safe_answer(query, "Подкатегория не найдена, обновите каталог.", show_alert=True)
+        await catalog_show_subcategories(update, context)
         return
-    async for session in get_session():
-        product = (await session.execute(
-            select(Product).where(Product.is_active == True, Product.article == article_input)
-        )).scalar_one_or_none()
-        break
-    if not product:
-        await message.reply_text("🔎 Товар с таким артикулом не найден.", reply_markup=kb_back_to_menu())
-        context.user_data.pop('state', None)
-        return
-
-    name = escape_markdown(product.name)
-    article = escape_markdown(product.article) if product.article else None
-    text = name
-    if article:
-        text += f"\nАртикул {article}"
-    if product.stock is not None:
-        text += f"\nНа складе: {product.stock}"
-    text += f"\n\nЦена {product.price:.0f} ₽"
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛒 Заказать", callback_data=f"order:start:{product.id}")],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
-    ])
-    try:
-        if product.photo_file_ids:
-            photo = product.photo_file_ids.split(',')[0]
-            await message.reply_photo(photo=photo, caption=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        else:
-            await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        logger.warning(f"Ошибка отправки фото для артикула {article_input}: {e}")
-        await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-
-    context.user_data.pop('state', None)
+    context.user_data["catalog_current_sub"] = subcategory
+    await show_products_page(query, context, page=0)
 
 
-# ================== РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ ==================
+@catalog_handler
+async def _back_to_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    context.user_data.pop("catalog_current_sub", None)
+    await catalog_show_subcategories(update, context, page=0)
+
+
+@catalog_handler
+async def _prodpage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    await show_products_page(query, context, page=int(query.data.split(":")[2]))
+
+
 def register(app):
-    # Категории
-    app.add_handler(CallbackQueryHandler(catalog_show_categories, pattern='^catalog:show$'))
+    # Категории (уровень 1) и пагинация.
+    app.add_handler(CallbackQueryHandler(catalog_show_categories, pattern="^catalog:show$"))
     app.add_handler(CallbackQueryHandler(
-        lambda update, context: catalog_show_categories(update, context,
-                                                        page=int(update.callback_query.data.split(":")[-1])),
-        pattern='^catalog:catlist:'
+        lambda u, c: catalog_show_categories(u, c, page=_page_arg(u)),
+        pattern="^catalog:catlist:",
     ))
+    # Подкатегории (уровень 2) и пагинация.
     app.add_handler(CallbackQueryHandler(
-        lambda update, context: catalog_show_subcategories(update, context,
-                                                           page=int(update.callback_query.data.split(":")[-1])),
-        pattern='^catalog:sublist:'
+        lambda u, c: catalog_show_subcategories(u, c, page=_page_arg(u)),
+        pattern="^catalog:sublist:",
     ))
-    # Выбор категории → сохраняем и показываем подкатегории
-    async def select_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        idx = int(query.data.split(":")[2])
-        cats = context.user_data.get('catalog_cats', {})
-        category = cats.get(idx)
-        if not category:
-            await query.answer("Категория не найдена.", show_alert=True)
-            return
-        context.user_data['catalog_current_cat'] = category
-        context.user_data.pop('catalog_current_sub', None)
-        await catalog_show_subcategories(update, context, page=0)
+    app.add_handler(CallbackQueryHandler(_select_category, pattern="^catalog:sc:"))
+    app.add_handler(CallbackQueryHandler(_select_subcategory, pattern="^catalog:ss:"))
 
-    app.add_handler(CallbackQueryHandler(select_category, pattern='^catalog:sc:'))
+    # Товары (уровень 3): возврат к подкатегориям и пагинация карточек.
+    app.add_handler(CallbackQueryHandler(_back_to_subs, pattern="^catalog:back_to_subs$"))
+    app.add_handler(CallbackQueryHandler(_prodpage, pattern="^catalog:prodpage:"))
 
-    # Выбор подкатегории → сохраняем и показываем товары
-    async def select_subcategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        idx = int(query.data.split(":")[2])
-        subs = context.user_data.get('catalog_subs', {})
-        subcategory = subs.get(idx)
-        if not subcategory:
-            await query.answer("Подкатегория не найдена.", show_alert=True)
-            return
-        context.user_data['catalog_current_sub'] = subcategory
-        await show_products_page(query, context, page=0)
+    # Заказ.
+    app.add_handler(CallbackQueryHandler(start_order, pattern="^order:start:"))
 
-    app.add_handler(CallbackQueryHandler(select_subcategory, pattern='^catalog:ss:'))
-
-    # Кнопка "Назад к подкатегориям" из товаров
-    async def back_to_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        context.user_data.pop('catalog_current_sub', None)
-        await catalog_show_subcategories(update, context, page=0)
-
-    app.add_handler(CallbackQueryHandler(back_to_subs, pattern='^catalog:back_to_subs$'))
-
-    # Пагинация товаров
-    async def prodpage_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        page = int(query.data.split(":")[2])
-        await show_products_page(query, context, page=page)
-
-    app.add_handler(CallbackQueryHandler(prodpage_handler, pattern='^catalog:prodpage:'))
-
-    # Заказ
-    app.add_handler(CallbackQueryHandler(start_order, pattern='^order:start:'))
-
-    # Поиск
-    app.add_handler(CallbackQueryHandler(search_name_start, pattern='^search:name$'))
-    app.add_handler(CallbackQueryHandler(search_article_start, pattern='^search:article$'))
+    # Поиск.
+    app.add_handler(CallbackQueryHandler(search_name_start, pattern="^search:name$"))
+    app.add_handler(CallbackQueryHandler(search_article_start, pattern="^search:article$"))
