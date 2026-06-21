@@ -35,6 +35,8 @@ from collections import Counter
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
     Update,
 )
 from telegram.constants import ParseMode
@@ -293,39 +295,63 @@ def _product_caption(product: Product) -> str:
 
 
 async def _send_product_card(bot, chat_id: int, product: Product) -> list[int]:
-    """Отправляет карточку товара ОДНИМ сообщением (фото/видео + подпись).
-
-    Баг 4: фото и описание шлём вместе (``caption``), а не двумя сообщениями —
-    иначе при параллельной отправке текст и фото могли приходить вразнобой.
-    При нескольких фото берём первое (одно сообщение гарантирует порядок и
-    привязку кнопки «Заказать»). Возвращает список id (всегда из одного элемента).
-    """
-    caption = _product_caption(product)
+    caption = _product_caption(product)  # HTML-подпись
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton("🛒 Заказать", callback_data=f"order:start:{product.id}")]]
     )
-    photos = product.photo_file_ids.split(",") if product.photo_file_ids else []
-    videos = product.video_file_ids.split(",") if product.video_file_ids else []
 
-    try:
+    photos = [p for p in product.photo_file_ids.split(",") if p] if product.photo_file_ids else []
+    videos = [v for v in product.video_file_ids.split(",") if v] if product.video_file_ids else []
+
+    media: list[InputMediaPhoto | InputMediaVideo] = []
+    for photo_id in photos:
+        media.append(InputMediaPhoto(media=photo_id))
+    for video_id in videos:
+        media.append(InputMediaVideo(media=video_id))
+
+    # Случай 1: нет медиа вообще — обычное текстовое сообщение с кнопкой
+    if not media:
+        m = await bot.send_message(
+            chat_id, text=caption, reply_markup=keyboard, parse_mode=ParseMode.HTML
+        )
+        return [m.message_id]
+
+    # Случай 2: ровно один файл — caption и кнопка в одном сообщении, без альбома
+    if len(media) == 1:
         if photos:
-            m = await bot.send_photo(chat_id, photo=photos[0], caption=caption,
-                                     reply_markup=keyboard, parse_mode=ParseMode.HTML)
-        elif videos:
-            m = await bot.send_video(chat_id, video=videos[0], caption=caption,
-                                     reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            m = await bot.send_photo(
+                chat_id, photo=photos[0], caption=caption,
+                reply_markup=keyboard, parse_mode=ParseMode.HTML
+            )
         else:
-            m = await bot.send_message(chat_id, text=caption, reply_markup=keyboard,
-                                       parse_mode=ParseMode.HTML)
-        return [m.message_id]
-    except Exception as exc:  # noqa: BLE001 — деградируем до текста при сбое медиа
-        logger.warning("product card send failed",
-                       extra={"event": "media_error", "product_id": product.id,
-                              "error": repr(exc)})
-        m = await bot.send_message(chat_id, text=caption, reply_markup=keyboard,
-                                   parse_mode=ParseMode.HTML)
+            m = await bot.send_video(
+                chat_id, video=videos[0], caption=caption,
+                reply_markup=keyboard, parse_mode=ParseMode.HTML
+            )
         return [m.message_id]
 
+    # Случай 3: несколько файлов — отправляем альбомом,
+    # подпись вешаем на первый элемент, кнопку — отдельным сообщением сразу после.
+    first = media[0]
+    if isinstance(first, InputMediaPhoto):
+        media[0] = InputMediaPhoto(media=first.media, caption=caption, parse_mode=ParseMode.HTML)
+    else:
+        media[0] = InputMediaVideo(media=first.media, caption=caption, parse_mode=ParseMode.HTML)
+
+    messages = await bot.send_media_group(chat_id, media=media)
+    message_ids = [msg.message_id for msg in messages]
+
+    # Telegram не позволяет прикрепить inline-клавиатуру к сообщению внутри media group
+    # через send_media_group, а edit_message_reply_markup ненадёжен из-за гонок/ретраев.
+    # Поэтому кнопку шлём отдельным служебным сообщением — это гарантированно работает.
+    btn_msg = await bot.send_message(
+        chat_id,
+        text="\u2063",  # invisible separator, чтобы не плодить лишний видимый текст
+        reply_markup=keyboard,
+    )
+    message_ids.append(btn_msg.message_id)
+
+    return message_ids
 
 @catalog_handler
 async def show_products_page(query, context, page: int = 0):
@@ -397,15 +423,12 @@ async def show_products_page(query, context, page: int = 0):
     # сдвигом старта (~0.06 с между запусками), чтобы перекрыть сетевые задержки
     # и при этом не упереться во флуд-лимиты Telegram. gather сохраняет порядок
     # результатов = порядок товаров, поэтому id карточек собираются по порядку.
-    async def _send_staggered(index: int, product: Product) -> list[int]:
-        await asyncio.sleep(0.06 * index)
-        return await _send_product_card(bot, chat_id, product)
-
-    results = await asyncio.gather(
-        *[_send_staggered(i, p) for i, p in enumerate(page_products)]
-    )
-    new_msgs = [mid for sub in results for mid in sub]
-    context.user_data["catalog_product_msgs"] = new_msgs
+    new_msgs = []
+    for i, p in enumerate(page_products):
+        ids = await _send_product_card(bot, chat_id, p)
+        new_msgs.extend(ids)
+        # Небольшая задержка между карточками (опционально, чтобы не упереться в лимиты)
+        await asyncio.sleep(0.1)
 
     # 2) Навигационное сообщение под карточками: крошки, счётчик, пагинация.
     nav_text = (f"{_crumbs(category, subcategory)}\n"
