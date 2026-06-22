@@ -190,7 +190,7 @@ def format_order_for_admin(order) -> str:
 async def _upload_file_to_max(file_like: io.BytesIO, file_type: str) -> str | None:
     headers = {"Authorization": settings.max_bot_token}
     async with aiohttp.ClientSession() as session:
-        # 1. Получаем URL для загрузки
+        # 1. Запрос URL / токена
         async with session.post(
             f"{MAX_API_BASE}/uploads?type={file_type}",
             headers=headers
@@ -201,12 +201,16 @@ async def _upload_file_to_max(file_like: io.BytesIO, file_type: str) -> str | No
                 logger.error(f"Не удалось получить URL: {resp.status} {resp_text}")
                 return None
             data = await resp.json()
+            # Для видео токен часто приходит сразу в ответе /uploads
+            token = data.get("token")
+            if token:
+                return token
             upload_url = data.get("url")
             if not upload_url:
                 logger.error("Ответ /uploads не содержит URL")
                 return None
 
-        # 2. Загружаем файл
+        # 2. Загрузка файла
         file_like.seek(0)
         form = aiohttp.FormData()
         form.add_field("data", file_like, filename="file")
@@ -216,16 +220,26 @@ async def _upload_file_to_max(file_like: io.BytesIO, file_type: str) -> str | No
             if resp.status != 200:
                 logger.error(f"Ошибка загрузки: {resp.status} {resp_text}")
                 return None
-            result = await resp.json()
-            # Извлекаем токен из вложенной структуры
-            photos = result.get("photos")
-            if photos:
-                # Берём первый попавшийся токен (обычно один)
-                for photo_id, photo_data in photos.items():
-                    token = photo_data.get("token")
-                    if token:
-                        return token
-            logger.error(f"Не удалось извлечь токен из ответа: {result}")
+
+            # 3. Извлечение токена из ответа (универсальный подход)
+            try:
+                result = await resp.json()
+                # Способ 1: плоский token (может быть у любого типа)
+                token = result.get("token")
+                if token:
+                    return token
+                # Способ 2: вложенный photos (характерно для фото)
+                photos = result.get("photos")
+                if photos:
+                    for photo_id, photo_data in photos.items():
+                        token = photo_data.get("token")
+                        if token:
+                            return token
+                # Способ 3: возможно, есть другие структуры (video, file), но пока не требуется
+            except Exception:
+                pass
+
+            logger.error(f"Не удалось извлечь токен из ответа: {resp_text}")
             return None
 
 async def upload_photo_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
@@ -241,13 +255,26 @@ async def upload_photo_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
         return None
 
 async def upload_video_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
-    """Загружает видео из Telegram в Max, возвращает Max-токен."""
+    """Загружает видео из Telegram в Max через aiomax, возвращает валидный токен."""
     try:
+        # Скачиваем видео во временный файл
         file_obj = await tg_bot.get_file(file_id)
-        file_like = io.BytesIO()
-        await file_obj.download_to_memory(file_like)
-        file_like.seek(0)
-        return await _upload_file_to_max(file_like, "video")
+        file_path = f"/tmp/{file_id}.mp4"
+        await file_obj.download_to_drive(file_path)
+
+        # Создаём временный MaxBot и загружаем видео
+        from aiomax import Bot as MaxBot
+        import aiohttp
+        max_bot = MaxBot(settings.max_bot_token)
+        max_bot.session = aiohttp.ClientSession()
+        max_bot.session.headers.update({'Authorization': settings.max_bot_token})
+
+        video_attachment = await max_bot.upload_video(file_path)
+        token = video_attachment.token
+        logger.info(f"Видео загружено через aiomax, токен: {token}")
+
+        await max_bot.session.close()
+        return token
     except Exception as e:
         logger.warning(f"Не удалось загрузить видео {file_id} в Max: {e}")
         return None

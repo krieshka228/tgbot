@@ -907,9 +907,9 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await session.commit()
 
     # QR-код (вне сессии)
-    qr_token = None
+    qr_file_id = None
     async for session in get_session():
-        qr_token = await get_bot_setting(session, "payment_qr_token")
+        qr_file_id = await get_bot_setting(session, "payment_qr_telegram")
 
     text = (
         f"✅ **Заказ #{order.id} оформлен!**\n\n"
@@ -922,10 +922,10 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
     ])
 
-    if qr_token:
+    if qr_file_id:
         await context.bot.send_photo(
             chat_id=query.message.chat_id,
-            photo=qr_token,
+            photo=qr_file_id,
             caption=text,
             reply_markup=kb,
             parse_mode=ParseMode.MARKDOWN
@@ -975,10 +975,15 @@ async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if message.photo:
             file_id = message.photo[-1].file_id
             async for session in get_session():
-                await set_bot_setting(session, "payment_qr_token", file_id)
+                # Сохраняем Telegram file_id для показа в Telegram
+                await set_bot_setting(session, "payment_qr_telegram", file_id)
+                # Загружаем это же фото в Max и сохраняем Max-токен
+                from bot.utils import upload_photo_to_max  # используем существующую функцию
+                max_token = await upload_photo_to_max(file_id, context.bot)
+                if max_token:
+                    await set_bot_setting(session, "payment_qr_token", max_token)
             context.user_data.pop('state', None)
-            await message.reply_text("✅ QR-код сохранён. Теперь он будет показываться покупателям при оформлении заказа.",
-                                     reply_markup=kb_main_menu(is_admin=True))
+            await message.reply_text("✅ QR-код сохранён для Telegram и Max.", reply_markup=kb_back_to_menu())
         else:
             await message.reply_text("❌ Пришлите изображение в формате PNG.", reply_markup=kb_back_to_menu())
         return

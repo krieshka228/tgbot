@@ -11,6 +11,7 @@ from bot.keyboards import kb_consent, kb_main_menu, kb_back_to_menu
 from bot.utils import escape_markdown
 from bot.config import ADMIN_USER_ID
 from bot.db import get_bot_setting, PendingOrder, Product
+from bot.handlers.catalog import clear_all_catalog_and_order_messages
 
 logger = logging.getLogger(__name__)
 
@@ -88,28 +89,13 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     context.user_data.pop('state', None)
 
-    # Удаляем старые товары и навигацию каталога (если они остались).
-    leftover_ids = list(context.user_data.pop('catalog_card_msgs', []))
-    leftover_ids += list(context.user_data.pop('catalog_product_msgs', []))
-    nav_msg_id = context.user_data.pop('catalog_nav_msg_id', None)
-    if nav_msg_id:
-        leftover_ids.append(nav_msg_id)
-    for msg_id in leftover_ids:
-        if msg_id == query.message.message_id:
-            continue
-        try:
-            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_id)
-        except Exception:
-            pass
+    # Очищаем все сообщения каталога и заказа (кроме текущего, если оно будет отредактировано)
+    await clear_all_catalog_and_order_messages(query, context, keep_current=True)
 
     is_admin = (query.from_user.id == ADMIN_USER_ID)
     text, kb = await get_main_menu_info(is_admin)
 
-    current_text = query.message.text or query.message.caption
-    current_markup = query.message.reply_markup
-    if current_text == text and current_markup == kb:
-        return
-
+    # Редактируем текущее сообщение (или отправляем новое, если редактирование не удалось)
     try:
         await query.edit_message_text(text=text, reply_markup=kb)
     except Exception:
