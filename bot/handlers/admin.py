@@ -144,7 +144,8 @@ async def show_stock_products_page(query, context, category: str = None, page: i
         if subcategory:
             stmt = stmt.where(
                 (Product.name == subcategory) |
-                (Product.name.startswith(subcategory + ','))
+                (Product.name.startswith(subcategory + ',')) |
+		(Product.name.startswith(subcategory + ' ,'))
             )
         total = (await session.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
         products = (await session.execute(

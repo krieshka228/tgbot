@@ -93,8 +93,16 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Не удалось уведомить администратора об отмене: {e}")
 
             # Отправляем подтверждение клиенту — безопасно, удаляя старое сообщение
+                        # Отправляем подтверждение клиенту с деталями заказа
+            order_info = format_order_for_admin(order)
+            text = f"❌ **Заказ #{order_id} отменён.**\n\n{order_info}"
+
             try:
-                await query.edit_message_text(f"❌ Заказ #{order_id} отменён.", reply_markup=kb_back_to_menu())
+                await query.edit_message_text(
+                    text,
+                    reply_markup=kb_back_to_menu(),
+                    parse_mode=ParseMode.MARKDOWN
+                )
             except Exception:
                 # Если не удалось отредактировать (например, сообщение с фото), удаляем и отправляем новое
                 try:
@@ -103,8 +111,9 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
                 await context.bot.send_message(
                     chat_id=query.message.chat_id,
-                    text=f"❌ Заказ #{order_id} отменён.",
-                    reply_markup=kb_back_to_menu()
+                    text=text,
+                    reply_markup=kb_back_to_menu(),
+                    parse_mode=ParseMode.MARKDOWN
                 )
         else:
             await query.edit_message_text(
