@@ -1,19 +1,27 @@
 """
-utils.py — Вспомогательные функции для парсинга постов, форматирования корзины и т.д.
+utils.py — Вспомогательные функции для парсинга постов, форматирования корзины и загрузки медиа в Max.
 """
 
 import re
-from typing import Optional
+import os
+import io
 import logging
+from typing import Optional
+
 from telegram import Bot as TelegramBot
 from aiomax import Bot as MaxBot
-import io
 import aiohttp
+
 from bot.config import settings
 
-MAX_API_BASE = "https://platform-api.max.ru"
+# Удаляем системные прокси-переменные, чтобы aiohttp не использовал их для Max API
+for var in ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']:
+    os.environ.pop(var, None)
+os.environ.setdefault('NO_PROXY', 'platform-api.max.ru,api.max.ru')
 
 logger = logging.getLogger(__name__)
+MAX_API_BASE = "https://platform-api.max.ru"
+
 
 def parse_quantity(text: str) -> Optional[int]:
     """Извлекает целое количество из текста (например, '3 шт', '5')."""
@@ -30,12 +38,12 @@ def escape_markdown(text: str) -> str:
 
 
 def parse_post_product(text: str) -> tuple:
+    """Парсит текст поста: возвращает (name, article, price, category, description, stock)."""
     if not text:
         return (None, None, 0.0, None, None, None)
 
     lines = [line.strip() for line in text.split('\n') if line.strip()]
 
-    # 1. Поиск цены – только в строке с ключевым словом "Цена" или знаком рубля
     price = 0.0
     price_line_idx = None
     for i, line in enumerate(lines):
@@ -50,7 +58,6 @@ def parse_post_product(text: str) -> tuple:
                 except ValueError:
                     pass
 
-    # 2. Поиск артикула (ключевое слово "Артикул")
     article = None
     article_line_idx = None
     for i, line in enumerate(lines):
@@ -60,7 +67,6 @@ def parse_post_product(text: str) -> tuple:
             article_line_idx = i
             break
 
-    # 3. Поиск остатка (ключевые фразы "В наличии", "Stock", "Остаток", "На складе")
     stock = None
     stock_line_idx = None
     for i, line in enumerate(lines):
@@ -70,7 +76,6 @@ def parse_post_product(text: str) -> tuple:
             stock_line_idx = i
             break
 
-    # 4. Поиск названия: строка над артикулом (если артикул найден) или первая неспециальная строка
     name = None
     if article_line_idx is not None and article_line_idx > 0:
         for i in range(article_line_idx - 1, -1, -1):
@@ -98,7 +103,6 @@ def parse_post_product(text: str) -> tuple:
         if name is None and lines:
             name = lines[0]
 
-    # 5. Категория — первая неслужебная строка после цены
     category = None
     if price_line_idx is not None:
         for i in range(price_line_idx + 1, len(lines)):
@@ -114,11 +118,9 @@ def parse_post_product(text: str) -> tuple:
             category = candidate
             break
 
-    # Удаляем хештеги из категории, если нужно
     if category:
         category = re.sub(r'#\w+', '', category).strip()
 
-    # 6. Описание — все строки, которые не являются названием, артикулом, ценой, остатком, категорией и не содержат "фотографий"
     indices_to_skip = {price_line_idx, article_line_idx, stock_line_idx}
     if name:
         try:
@@ -145,6 +147,7 @@ def parse_post_product(text: str) -> tuple:
 
     return (name, article, price, category, description, stock)
 
+
 def format_cart(order) -> str:
     """Форматирует корзину для отображения."""
     if not order.items:
@@ -158,7 +161,7 @@ def format_cart(order) -> str:
 
 
 def format_order_for_admin(order) -> str:
-    """Форматирует информацию о заказе для администратора. Приоритет: @username."""
+    """Форматирует информацию о заказе для администратора."""
     user = order.user
     if user:
         user_info = f"@{user.username}" if user.username else (user.full_name or "Без имени")
@@ -187,10 +190,15 @@ def format_order_for_admin(order) -> str:
         f"💰 **Итого: {order.total_amount:.0f} ₽**"
     )
 
+
 async def _upload_file_to_max(file_like: io.BytesIO, file_type: str) -> str | None:
+    """Загружает файл в Max и возвращает Max-токен."""
     headers = {"Authorization": settings.max_bot_token}
-    async with aiohttp.ClientSession() as session:
-        # 1. Запрос URL / токена
+    # Явно создаём сессию без прокси и с таймаутом
+    connector = aiohttp.TCPConnector(ssl=True)
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # 1. Получаем URL для загрузки
         async with session.post(
             f"{MAX_API_BASE}/uploads?type={file_type}",
             headers=headers
@@ -201,7 +209,6 @@ async def _upload_file_to_max(file_like: io.BytesIO, file_type: str) -> str | No
                 logger.error(f"Не удалось получить URL: {resp.status} {resp_text}")
                 return None
             data = await resp.json()
-            # Для видео токен часто приходит сразу в ответе /uploads
             token = data.get("token")
             if token:
                 return token
@@ -210,7 +217,7 @@ async def _upload_file_to_max(file_like: io.BytesIO, file_type: str) -> str | No
                 logger.error("Ответ /uploads не содержит URL")
                 return None
 
-        # 2. Загрузка файла
+        # 2. Загружаем файл
         file_like.seek(0)
         form = aiohttp.FormData()
         form.add_field("data", file_like, filename="file")
@@ -221,26 +228,23 @@ async def _upload_file_to_max(file_like: io.BytesIO, file_type: str) -> str | No
                 logger.error(f"Ошибка загрузки: {resp.status} {resp_text}")
                 return None
 
-            # 3. Извлечение токена из ответа (универсальный подход)
             try:
                 result = await resp.json()
-                # Способ 1: плоский token (может быть у любого типа)
                 token = result.get("token")
                 if token:
                     return token
-                # Способ 2: вложенный photos (характерно для фото)
                 photos = result.get("photos")
                 if photos:
                     for photo_id, photo_data in photos.items():
                         token = photo_data.get("token")
                         if token:
                             return token
-                # Способ 3: возможно, есть другие структуры (video, file), но пока не требуется
             except Exception:
                 pass
 
             logger.error(f"Не удалось извлечь токен из ответа: {resp_text}")
             return None
+
 
 async def upload_photo_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
     """Загружает фото из Telegram в Max, возвращает Max-токен."""
@@ -254,19 +258,20 @@ async def upload_photo_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
         logger.warning(f"Не удалось загрузить фото {file_id} в Max: {e}")
         return None
 
+
 async def upload_video_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
     """Загружает видео из Telegram в Max через aiomax, возвращает валидный токен."""
     try:
-        # Скачиваем видео во временный файл
         file_obj = await tg_bot.get_file(file_id)
         file_path = f"/tmp/{file_id}.mp4"
         await file_obj.download_to_drive(file_path)
 
-        # Создаём временный MaxBot и загружаем видео
         from aiomax import Bot as MaxBot
-        import aiohttp
         max_bot = MaxBot(settings.max_bot_token)
-        max_bot.session = aiohttp.ClientSession()
+
+        # Создаём сессию с коннектором без прокси
+        connector = aiohttp.TCPConnector(ssl=True)
+        max_bot.session = aiohttp.ClientSession(connector=connector)
         max_bot.session.headers.update({'Authorization': settings.max_bot_token})
 
         video_attachment = await max_bot.upload_video(file_path)
@@ -279,11 +284,9 @@ async def upload_video_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
         logger.warning(f"Не удалось загрузить видео {file_id} в Max: {e}")
         return None
 
+
 def _parse_post_link(text: str) -> Optional[int]:
-    """
-    Извлекает post_id из текста: просто число или из URL /post/123.
-    Также пробует извлечь из ссылки вида https://t.me/c/.../123.
-    """
+    """Извлекает post_id из текста: просто число или из URL /post/123."""
     if not text:
         return None
     text = text.strip()
