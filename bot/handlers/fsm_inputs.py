@@ -791,45 +791,53 @@ async def process_direct_order(message, text, context):
                              reply_markup=kb_cart_actions(order.id))
     return True
 
+
 async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подтверждение отложенного заказа из комментария."""
+    logger.info("=== porder_confirm START ===")
     query = update.callback_query
     await query.answer()
     parts = query.data.split(":")
     product_id = int(parts[2])
     qty = int(parts[3])
     user_id = query.from_user.id
+    logger.info(f"product_id={product_id}, qty={qty}, user_id={user_id}")
 
     # Проверяем наличие QR-кода
     async for session in get_session():
+        logger.info("Checking QR token...")
         token = await get_bot_setting(session, "payment_qr_token")
+        logger.info(f"QR token exists: {bool(token)}")
         if not token:
+            logger.warning("QR token missing")
             if user_id == ADMIN_USER_ID:
                 await query.edit_message_text("⚠️ QR-код не задан. Загрузите его в админ‑меню.")
             else:
                 await query.edit_message_text("⚠️ Бот временно недоступен.")
-            # ✅ ИСПРАВЛЕНО: ищем по user_id
             stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
             pending = (await session.execute(stmt)).scalar_one_or_none()
             if pending:
+                logger.info(f"Deleting PendingOrder for user {user_id}")
                 if pending.confirmation_msg_id:
                     try:
                         await context.bot.delete_message(
                             chat_id=user_id,
                             message_id=pending.confirmation_msg_id
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"Failed to delete confirmation msg: {e}")
                 await session.delete(pending)
                 await session.commit()
             return
         break
 
     async for session in get_session():
+        logger.info(f"Getting product {product_id}...")
         product = await session.get(Product, product_id)
+        logger.info(f"Product found: {product is not None}, active: {product.is_active if product else False}")
         if not product or not product.is_active:
+            logger.warning("Product not found or inactive")
             await query.edit_message_text("❌ Товар недоступен.")
-            # ✅ ИСПРАВЛЕНО: ищем по user_id
             stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
             pending = (await session.execute(stmt)).scalar_one_or_none()
             if pending:
@@ -848,13 +856,13 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if product.stock is not None and qty > product.stock:
+            logger.warning(f"Not enough stock: requested {qty}, available {product.stock}")
             await query.edit_message_text(
                 f"❌ Недостаточно товара. Доступно только {product.stock} шт.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
                 ])
             )
-            # ✅ ИСПРАВЛЕНО: ищем по user_id
             stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
             pending = (await session.execute(stmt)).scalar_one_or_none()
             if pending:
@@ -872,12 +880,14 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('state', None)
             return
 
+        logger.info("Reserving stock...")
         if product.stock is not None:
             product.stock -= qty
             product.is_active = product.stock > 0
             product.in_stock = product.stock > 0
 
         from bot.db import get_or_create_draft, add_item_to_order
+        logger.info("Creating order...")
         order = await get_or_create_draft(session, user_id)
         stmt = select(Order).where(Order.id == order.id).options(
             selectinload(Order.items).selectinload(OrderItem.product)
@@ -889,8 +899,9 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await session.commit()
         invalidate_catalog_cache()
         cart_text = format_cart(order)
+        logger.info(f"Order #{order.id} created successfully")
 
-        # ✅ ИСПРАВЛЕНО: ищем по user_id
+        logger.info("Deleting PendingOrder...")
         stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
         pending = (await session.execute(stmt)).scalar_one_or_none()
         if pending:
@@ -900,14 +911,16 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=user_id,
                         message_id=pending.confirmation_msg_id
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to delete confirmation msg: {e}")
             await session.delete(pending)
             await session.commit()
+        logger.info("PendingOrder deleted")
 
     qr_file_id = None
     async for session in get_session():
         qr_file_id = await get_bot_setting(session, "payment_qr_telegram")
+    logger.info(f"QR file_id: {qr_file_id is not None}")
 
     text = (
         f"✅ **Заказ #{order.id} оформлен!**\n\n"
@@ -921,6 +934,7 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     if qr_file_id:
+        logger.info("Sending photo with order...")
         await context.bot.send_photo(
             chat_id=query.message.chat_id,
             photo=qr_file_id,
@@ -928,24 +942,26 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb,
             parse_mode=ParseMode.MARKDOWN
         )
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
     else:
+        logger.info("Sending text message with order...")
         await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
     context.user_data.pop('pending_order', None)
     context.user_data.pop('state', None)
+    logger.info("=== porder_confirm END ===")
+
 
 async def porder_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("=== porder_cancel START ===")
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    logger.info(f"user_id={user_id}")
+
     async for session in get_session():
-        # ✅ ИСПРАВЛЕНО: ищем по user_id
         stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
         pending = (await session.execute(stmt)).scalar_one_or_none()
+        logger.info(f"PendingOrder found: {pending is not None}")
         if pending:
             if pending.confirmation_msg_id:
                 try:
@@ -953,16 +969,19 @@ async def porder_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=user_id,
                         message_id=pending.confirmation_msg_id
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to delete: {e}")
             await session.delete(pending)
             await session.commit()
+            logger.info("PendingOrder deleted")
+
     context.user_data.pop('pending_order', None)
     context.user_data.pop('state', None)
     from bot.handlers.start import get_main_menu_info
     is_admin = (user_id == ADMIN_USER_ID)
     text, kb = await get_main_menu_info(is_admin)
     await query.edit_message_text(text, reply_markup=kb)
+    logger.info("=== porder_cancel END ===")
 
 async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
