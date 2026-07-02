@@ -266,6 +266,7 @@ async def _notify_admin_comment(context, sender, product, text: str) -> None:
 
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает комментарии в группе обсуждения к постам канала."""
     message = update.message
     if not message or not message.text:
         return
@@ -276,7 +277,28 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = message.text.strip()
     qty = parse_quantity(text)
 
-    # Используем единую функцию для определения post_id
+    # Определяем post_id (используем ту же логику, что и в cart.py)
+    def _resolve_post_id(msg):
+        reply = msg.reply_to_message
+        if reply is not None:
+            origin = getattr(reply, "forward_origin", None)
+            if isinstance(origin, MessageOriginChannel):
+                return str(origin.message_id)
+            if reply.text:
+                import re
+                match = re.search(r'/(\d+)$', reply.text)
+                if match:
+                    return match.group(1)
+                match = re.search(r'/post/(\d+)', reply.text)
+                if match:
+                    return match.group(1)
+                if reply.text.strip().isdigit():
+                    return reply.text.strip()
+            return str(reply.message_id)
+        if message.message_thread_id:
+            return str(message.message_thread_id)
+        return None
+
     post_id = _resolve_post_id(message)
 
     logger.info(
@@ -296,7 +318,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             select(Product).where(Product.post_id == post_id)
         )).scalar_one_or_none()
 
-        # 2. Если не нашли, пробуем найти по артикулу из реплая (text или caption)
+        # 2. Если не нашли, пробуем найти по артикулу из реплая
         if not product:
             reply = message.reply_to_message
             if reply:
@@ -304,7 +326,6 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if reply_text:
                     from bot.utils import parse_post_product
                     name, article, _, _, _, _ = parse_post_product(reply_text)
-                    logger.debug(f"Extracted article from reply: {article}")
                     if article:
                         product = (await session.execute(
                             select(Product).where(Product.article == article)
@@ -314,20 +335,13 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await session.commit()
                             logger.info("product found by article, updated post_id",
                                         extra={"article": article, "product_id": product.id})
-                        else:
-                            logger.warning(f"Product with article {article} not found")
-                    else:
-                        logger.debug("No article extracted from reply text")
-                else:
-                    logger.debug("No reply text or caption to extract article")
 
         if not product:
             await message.reply_text("❌ Товар не найден. Возможно, пост был добавлен до синхронизации.")
             logger.warning("no product for post_id", extra={"post_id": post_id})
             return
 
-        # 3. Сохраняем комментарий
-        from bot.db import Comment
+        # 3. Сохраняем комментарий (импорт Comment уже есть в начале файла)
         session.add(Comment(product_id=product.id, user_id=user_id, text=text))
         await session.commit()
         logger.info("comment saved", extra={"product_id": product.id})
@@ -337,14 +351,14 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("💬 Спасибо за комментарий! Чтобы заказать, напишите количество.")
             return
 
-        # 5. Проверка активности
+        # 5. Проверка активности товара
         if not product.is_active:
             await message.reply_text("❌ Этот товар временно недоступен.")
             return
 
-        # 6. Проверка QR
-        qr_token = await get_bot_setting(session, "payment_qr_token")
-        if not qr_token:
+        # 6. Проверка наличия QR-кода (Telegram file_id) – ИСПРАВЛЕНО
+        qr_telegram = await get_bot_setting(session, "payment_qr_telegram")
+        if not qr_telegram:
             await message.reply_text("⚠️ Оплата временно недоступна. Попробуйте позже.")
             return
 
@@ -360,7 +374,6 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 8. Отправка подтверждения в личку
         try:
             total = product.price * qty
-            from bot.utils import escape_markdown
             text_msg = (
                 f"🛒 **Ваш заказ:**\n"
                 f"• {escape_markdown(product.name)} — {qty} шт. × {product.price:.0f} ₽ = {total:.0f} ₽\n\n"
@@ -389,7 +402,6 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await message.delete()
             return
-
 def register(app):
     # Универсальный обработчик для канала
     app.add_handler(MessageHandler(

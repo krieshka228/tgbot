@@ -370,20 +370,22 @@ async def admin_upload_qr_start(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def admin_show_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущий QR-код для оплаты (Telegram file_id)."""
     query = update.callback_query
     await query.answer()
     if query.from_user.id != ADMIN_USER_ID:
         await query.answer("Нет доступа.", show_alert=True)
         return
     async for session in get_session():
-        token = await get_bot_setting(session, "payment_qr_token")
-    if not token:
-        await query.answer("QR-код не задан.", show_alert=True)
+        file_id = await get_bot_setting(session, "payment_qr_telegram")
+    if not file_id:
+        await query.answer("QR-код не загружен.", show_alert=True)
         return
-    await context.bot.send_photo(chat_id=query.message.chat_id, photo=token)
+    await context.bot.send_photo(chat_id=query.message.chat_id, photo=file_id)
 
 
 async def admin_delete_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет QR-код (очищает оба ключа: Telegram и Max)."""
     query = update.callback_query
     await query.answer()
     if query.from_user.id != ADMIN_USER_ID:
@@ -391,6 +393,7 @@ async def admin_delete_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     async for session in get_session():
         await set_bot_setting(session, "payment_qr_token", "")
+        await set_bot_setting(session, "payment_qr_telegram", "")
     await query.answer("QR-код удалён.", show_alert=True)
 
 
@@ -437,13 +440,14 @@ async def stock_subcategory_page(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data['admin_current_sub'] = subcategory
     await show_stock_products_page(query, context, page=0)
 async def set_stock_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запускает ввод нового остатка для товара."""
     query = update.callback_query
     await query.answer()
     if query.from_user.id != ADMIN_USER_ID:
         await query.answer("Нет доступа.", show_alert=True)
         return
     product_id = int(query.data.split(":")[-1])
-    # Сохраняем контекст для возврата
+    # Сохраняем контекст для возврата (единожды)
     context.user_data['admin_return_context'] = {
         'category': context.user_data.get('admin_current_cat'),
         'subcategory': context.user_data.get('admin_current_sub'),
@@ -451,23 +455,15 @@ async def set_stock_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     context.user_data['state'] = 'admin_set_stock'
     context.user_data['data'] = {'product_id': product_id}
-    # Контекст для кнопки «Назад к списку товаров».
-    context.user_data['admin_return_context'] = {
-        'category': context.user_data.get('admin_current_cat'),
-        'subcategory': context.user_data.get('admin_current_sub'),
-        'page': context.user_data.get('admin_current_page', 0),
-    }
     back_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("↩️ К списку товаров", callback_data="admin:back_to_products")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")],
     ])
-    # Отправляем запрос и сохраняем его message_id
     sent_msg = await query.message.reply_text(
         "✏️ Введите новое количество (целое число) или 0, чтобы скрыть товар:",
         reply_markup=back_kb
     )
     context.user_data['admin_stock_msg_id'] = sent_msg.message_id
-    # Удаляем исходное сообщение с кнопкой (чтобы не мешало)
     try:
         await query.message.delete()
     except Exception:

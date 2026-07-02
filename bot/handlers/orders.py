@@ -47,7 +47,8 @@ async def orders_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page: 
             .limit(ORDERS_PER_PAGE)
         )
         orders = (await session.execute(stmt)).scalars().all()
-        qr_token = await get_bot_setting(session, "payment_qr_token")
+        # ИСПРАВЛЕНО: используем payment_qr_telegram для проверки наличия QR
+        qr_telegram = await get_bot_setting(session, "payment_qr_telegram")
 
     if total == 0:
         await query.edit_message_text("📋 У вас пока нет оформленных заказов.", reply_markup=kb_back_to_menu())
@@ -56,7 +57,6 @@ async def orders_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page: 
     total_pages = (total - 1) // ORDERS_PER_PAGE + 1
     lines = [f"📋 **Ваши заказы** (стр. {page+1}/{total_pages})\n"]
     now = datetime.now(timezone.utc)
-    CANCEL_TIMEOUT = 300  # 5 минут
 
     for order in orders:
         label = STATUS_LABEL.get(order.status.value, order.status.value)
@@ -71,14 +71,12 @@ async def orders_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page: 
     kb_buttons = []
     for order in orders:
         row = []
-        if order.status == OrderStatus.pending:
-            # Исправление: делаем created_at offset-aware
-            created_at = order.created_at.replace(tzinfo=timezone.utc)
-            age_seconds = (now - created_at).total_seconds()
-            if age_seconds < CANCEL_TIMEOUT:
-                row.append(InlineKeyboardButton(
-                    f"❌ Отменить #{order.id}", callback_data=f"payment:cancel:{order.id}"))
-            if qr_token:
+        # НОВОЕ: разрешаем отмену для статусов pending и paid (до подтверждения)
+        if order.status in (OrderStatus.pending, OrderStatus.paid):
+            row.append(InlineKeyboardButton(
+                f"❌ Отменить #{order.id}", callback_data=f"payment:cancel:{order.id}"))
+            # Кнопка оплаты только для pending (если QR есть)
+            if order.status == OrderStatus.pending and qr_telegram:
                 row.append(InlineKeyboardButton(
                     f"💳 Оплатить #{order.id}", callback_data=f"payment:receipt:{order.id}"))
         elif order.status == OrderStatus.confirmed:
@@ -100,8 +98,6 @@ async def orders_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page: 
     keyboard = InlineKeyboardMarkup(kb_buttons)
 
     await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
-
-
 async def orders_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик переключения страниц."""
     query = update.callback_query

@@ -369,7 +369,6 @@ async def _send_product_card(bot, chat_id: int, product: Product) -> list[int]:
 async def show_products_page(query, context, page: int = 0):
     """Показывает страницу товаров медиа-карточками (3/стр.) + навигацию."""
     await _safe_answer(query, "⏳ Загрузка...")
-    # Возврат к списку отменяет незавершённый ввод количества (state order_qty).
     context.user_data.pop("state", None)
     chat_id = query.message.chat_id
     bot = context.bot
@@ -383,12 +382,10 @@ async def show_products_page(query, context, page: int = 0):
         InlineKeyboardButton("↩️ К категориям", callback_data="catalog:show")
     )
 
-    # Чистим прошлые карточки/навигацию и сообщение, с которого пришли
+    # Удаляем старые карточки и навигацию (включая текущее сообщение)
     await _clear_product_messages(query, context, keep_current=False)
-    try:
-        await query.message.delete()
-    except Exception:  # noqa: BLE001
-        pass
+    # ❌ УДАЛЯЕМ ЛИШНЕЕ УДАЛЕНИЕ:
+    # await query.message.delete()  # ← было, теперь убрано
 
     if not category:
         msg = await bot.send_message(
@@ -408,7 +405,6 @@ async def show_products_page(query, context, page: int = 0):
     else:
         products_all = all_products
 
-    # Пустая категория/подкатегория — одно сообщение с кнопкой «Назад».
     if not products_all:
         msg = await bot.send_message(
             chat_id,
@@ -417,10 +413,6 @@ async def show_products_page(query, context, page: int = 0):
             parse_mode=ParseMode.HTML,
         )
         context.user_data["catalog_nav_msg_id"] = msg.message_id
-        logger.info("catalog: empty products", extra={"event": "catalog_products_empty",
-                                                       "user_id": query.from_user.id,
-                                                       "category": category,
-                                                       "subcategory": subcategory})
         return
 
     total = len(products_all)
@@ -430,17 +422,14 @@ async def show_products_page(query, context, page: int = 0):
     page_products = products_all[page * PRODUCTS_PER_PAGE:
                                  page * PRODUCTS_PER_PAGE + PRODUCTS_PER_PAGE]
 
-    # 1) Карточки товаров
     new_msgs = []
-    for i, p in enumerate(page_products):
+    for p in page_products:
         ids = await _send_product_card(bot, chat_id, p)
         new_msgs.extend(ids)
         await asyncio.sleep(0.1)
 
-    # ✅ СОХРАНЯЕМ ID КАРТОЧЕК ДЛЯ УДАЛЕНИЯ
     context.user_data["catalog_product_msgs"] = new_msgs
 
-    # 2) Навигационное сообщение
     nav_text = (f"{_crumbs(category, subcategory)}\n"
                 f"🔎 Найдено {total} товаров. Страница {page + 1} из {total_pages}")
     nav_kb = _pagination_row(page, total_pages, "catalog:prodpage")
@@ -451,13 +440,6 @@ async def show_products_page(query, context, page: int = 0):
                                      parse_mode=ParseMode.HTML)
     context.user_data["catalog_nav_msg_id"] = nav_msg.message_id
 
-    logger.info("catalog: products page", extra={"event": "catalog_products",
-                                                 "user_id": query.from_user.id,
-                                                 "category": category,
-                                                 "subcategory": subcategory,
-                                                 "page": page, "total": total})
-
-    # 3) Префетч следующей страницы в фоне
     if page + 1 < total_pages:
         asyncio.create_task(_prefetch_category(category))
 
@@ -479,12 +461,12 @@ async def start_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _safe_answer(query)
 
-    # Проверка наличия QR-кода (обязательно для заказа)
+    # Проверяем наличие Telegram file_id QR-кода (для отправки после оформления)
     async for session in get_session():
-        token = await get_bot_setting(session, "payment_qr_token")
-        if not token:
+        qr_telegram = await get_bot_setting(session, "payment_qr_telegram")
+        if not qr_telegram:
             if query.from_user.id == ADMIN_USER_ID:
-                await _safe_answer(query, "⚠️ QR-код не задан. Загрузите его в админ‑меню.",
+                await _safe_answer(query, "⚠️ QR-код не загружен. Загрузите его в админ‑меню.",
                                    show_alert=True)
             else:
                 await _safe_answer(query, "⚠️ Бот временно недоступен.", show_alert=True)
@@ -499,22 +481,13 @@ async def start_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_answer(query, "Товар недоступен.", show_alert=True)
         return
 
-    # Удаляем старые карточки и навигацию
     chat_id = query.message.chat_id
     await _clear_product_messages(query, context, keep_current=False)
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
 
-    # Подпись
     text = _product_caption(product) + "\n\n✏️ Введите количество:"
-
-    # Списки медиа
     photos = [p for p in product.photo_file_ids.split(",") if p] if product.photo_file_ids else []
     videos = [v for v in product.video_file_ids.split(",") if v] if product.video_file_ids else []
 
-    # Клавиатура с возвратом к списку и главным меню
     back_page = context.user_data.get("catalog_prod_page", 0)
     order_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("↩️ К списку", callback_data=f"catalog:prodpage:{back_page}")],
@@ -522,48 +495,32 @@ async def start_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     card_msg_ids = []
-
-    # -------------------- ОТПРАВКА МЕДИА --------------------
     if not photos and not videos:
-        # Без медиа – просто текст
         m = await context.bot.send_message(chat_id, text=text, reply_markup=order_kb,
                                            parse_mode=ParseMode.HTML)
         card_msg_ids.append(m.message_id)
-
     elif len(photos) == 1 and not videos:
-        # Одно фото
         m = await context.bot.send_photo(chat_id, photo=photos[0], caption=text,
                                          reply_markup=order_kb, parse_mode=ParseMode.HTML)
         card_msg_ids.append(m.message_id)
-
     elif len(videos) == 1 and not photos:
-        # Одно видео
         m = await context.bot.send_video(chat_id, video=videos[0], caption=text,
                                          reply_markup=order_kb, parse_mode=ParseMode.HTML)
         card_msg_ids.append(m.message_id)
-
     else:
-        # Несколько медиа → альбом + отдельное сообщение с кнопкой
         media = []
-        # Сначала фото (первое с подписью)
         for idx, fid in enumerate(photos):
             if idx == 0:
                 media.append(InputMediaPhoto(media=fid, caption=text, parse_mode=ParseMode.HTML))
             else:
                 media.append(InputMediaPhoto(media=fid))
-        # Затем видео
         for fid in videos:
             media.append(InputMediaVideo(media=fid))
-        # Если фото нет, а видео несколько – подпись на первом видео
         if not photos and videos:
             media[0] = InputMediaVideo(media=videos[0], caption=text, parse_mode=ParseMode.HTML)
-
-        # Отправляем альбом
         msgs = await context.bot.send_media_group(chat_id, media=media)
         for m in msgs:
             card_msg_ids.append(m.message_id)
-
-        # Отдельное сообщение с кнопкой (невидимый символ, чтобы не плодить лишний текст)
         btn_msg = await context.bot.send_message(
             chat_id,
             text="Выберите действие",
@@ -571,18 +528,12 @@ async def start_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         card_msg_ids.append(btn_msg.message_id)
 
-    # Сохраняем ID всех сообщений (для последующего удаления)
     context.user_data["data"] = {
         "product_id": product_id,
         "card_msg_ids": card_msg_ids,
-        # Для обратной совместимости (если где-то ожидается `card_msg_id`)
         "card_msg_id": card_msg_ids[0] if card_msg_ids else None,
     }
     context.user_data["state"] = "order_qty"
-
-    logger.info("catalog: order started", extra={"event": "order_start",
-                                                 "user_id": query.from_user.id,
-                                                 "product_id": product.id})
 
 
 # ========================== ПОИСК (входы) =============================
@@ -655,9 +606,9 @@ async def _back_to_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _safe_answer(query)
     context.user_data.pop("catalog_current_sub", None)
-    # Очищаем всё – карточки, навигацию и сообщения заказа
-    await clear_all_catalog_and_order_messages(query, context, keep_current=False)
-    # Показываем подкатегории
+
+    # FIXED: оставляем текущее сообщение (оно будет отредактировано)
+    await clear_all_catalog_and_order_messages(query, context, keep_current=True)
     await catalog_show_subcategories(update, context, page=0)
 
 

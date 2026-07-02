@@ -22,8 +22,8 @@ async def get_main_menu_info(is_admin: bool) -> tuple[str, InlineKeyboardMarkup]
 
     qr_available = False
     async for session in get_session():
-        token = await get_bot_setting(session, "payment_qr_token")
-        if token:
+        file_id = await get_bot_setting(session, "payment_qr_telegram")
+        if file_id:
             qr_available = True
             break
 

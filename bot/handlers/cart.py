@@ -1,13 +1,30 @@
+"""
+handlers/cart.py — корзина, оформление заказа.
+"""
+import asyncio
 import logging
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
-from bot.db import get_session, get_or_create_user, get_draft_order, remove_item_from_order, recalculate_total, OrderStatus
-from bot.db import Product, Order, OrderItem, get_bot_setting, invalidate_catalog_cache
-from bot.keyboards import kb_cart_actions, kb_cart_items_remove, kb_back_to_menu
-from bot.utils import format_cart
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
+
+from bot.db import (
+    get_session,
+    get_or_create_user,
+    get_draft_order,
+    remove_item_from_order,
+    recalculate_total,
+    OrderStatus,
+    Order,
+    OrderItem,
+    Product,
+    get_bot_setting,
+    invalidate_catalog_cache,
+)
+from bot.keyboards import kb_cart_actions, kb_cart_items_remove, kb_back_to_menu, kb_main_menu
+from bot.utils import format_cart, escape_markdown
 from bot.config import ADMIN_USER_ID
 
 logger = logging.getLogger(__name__)
@@ -240,95 +257,134 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Финальное подтверждение заказа с атомарным резервированием и показом QR-кода."""
     query = update.callback_query
     await query.answer()
+
     order_id = int(query.data.split(":")[-1])
     user_id = query.from_user.id
 
-    # Проверка доступности QR
-    async for session in get_session():
-        token = await get_bot_setting(session, "payment_qr_token")
-        if not token:
-            if user_id == ADMIN_USER_ID:
-                await query.edit_message_text("⚠️ QR-код не задан. Загрузите его в админ‑меню.")
-            else:
-                await query.edit_message_text("⚠️ Бот временно недоступен.")
-            return
-        break
+    try:
+        # 1. Получаем Telegram file_id QR-кода
+        qr_telegram = None
+        for attempt in range(3):
+            try:
+                async for session in get_session():
+                    qr_telegram = await get_bot_setting(session, "payment_qr_telegram")
+                if qr_telegram:
+                    break
+            except Exception as e:
+                logger.warning(f"QR получение, попытка {attempt+1}: {e}")
+                await asyncio.sleep(0.5)
 
-    async for session in get_session():
-        stmt = (
-            select(Order)
-            .where(Order.id == order_id, Order.user_id == user_id, Order.status == OrderStatus.draft)
-            .options(selectinload(Order.items).selectinload(OrderItem.product))
-        )
-        result = await session.execute(stmt)
-        order = result.scalar_one_or_none()
-
-        if not order:
-            await query.edit_message_text("❌ Заказ не найден или уже оформлен.")
+        if not qr_telegram:
+            await query.edit_message_text(
+                "⚠️ QR-код не загружен. Обратитесь к администратору.",
+                reply_markup=kb_back_to_menu()
+            )
             return
 
-        product_ids = [item.product_id for item in order.items]
-        lock_stmt = select(Product).where(Product.id.in_(product_ids)).with_for_update()
-        locked_products = (await session.execute(lock_stmt)).scalars().all()
-        product_map = {p.id: p for p in locked_products}
+        # 2. Обработка заказа
+        async for session in get_session():
+            stmt = (
+                select(Order)
+                .where(Order.id == order_id, Order.user_id == user_id)
+                .options(selectinload(Order.items).selectinload(OrderItem.product))
+                .with_for_update()
+            )
+            result = await session.execute(stmt)
+            order = result.scalar_one_or_none()
 
-        for item in order.items:
-            product = product_map.get(item.product_id)
-            if product and product.stock is not None and item.quantity > product.stock:
-                await query.edit_message_text(
-                    f"❌ К сожалению, товар «{product.name}» уже разобрали. "
-                    f"Доступно: {product.stock} шт. Пожалуйста, измените количество.",
-                    reply_markup=kb_cart_actions(order.id)
-                )
+            if not order:
+                await query.edit_message_text("❌ Заказ не найден.", reply_markup=kb_back_to_menu())
                 return
 
-        for item in order.items:
-            product = product_map[item.product_id]
-            if product and product.stock is not None:
-                product.stock -= item.quantity
-                product.is_active = product.stock > 0
-                product.in_stock = product.stock > 0
+            if order.status != OrderStatus.draft:
+                if order.status == OrderStatus.pending:
+                    text = f"ℹ️ Заказ #{order.id} уже оформлен и ожидает оплаты."
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("💳 Оплатить", callback_data=f"payment:receipt:{order.id}")],
+                        [InlineKeyboardButton("❌ Отменить", callback_data=f"payment:cancel:{order.id}")],
+                        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
+                    ])
+                    await query.edit_message_text(text, reply_markup=kb)
+                else:
+                    await query.edit_message_text(
+                        f"ℹ️ Заказ #{order.id} уже имеет статус {order.status.value}.",
+                        reply_markup=kb_back_to_menu()
+                    )
+                return
 
-        order.status = OrderStatus.pending
-        await session.commit()
-        invalidate_catalog_cache()
-        cart_text = format_cart(order)
+            product_ids = [item.product_id for item in order.items]
+            if product_ids:
+                lock_products = select(Product).where(Product.id.in_(product_ids)).with_for_update()
+                locked = (await session.execute(lock_products)).scalars().all()
+                product_map = {p.id: p for p in locked}
 
-    # Получаем QR-код
-    qr_token = None
-    async for session in get_session():
-        qr_token = await get_bot_setting(session, "payment_qr_token")
+                for item in order.items:
+                    product = product_map.get(item.product_id)
+                    if product and product.stock is not None and item.quantity > product.stock:
+                        await query.edit_message_text(
+                            f"❌ Товар «{product.name}» доступен в количестве {product.stock} шт. "
+                            "Пожалуйста, измените количество.",
+                            reply_markup=kb_cart_actions(order.id)
+                        )
+                        return
 
-    text = (
-        f"✅ **Заказ #{order.id} оформлен!**\n\n"
-        f"{cart_text}\n\n"
-        "После оплаты нажмите кнопку ниже и пришлите фото чека."
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💳 Я оплатил — отправить чек", callback_data=f"payment:receipt:{order.id}")],
-        [InlineKeyboardButton("❌ Отменить заказ", callback_data=f"payment:cancel:{order.id}")],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
-    ])
+                for item in order.items:
+                    product = product_map[item.product_id]
+                    if product and product.stock is not None:
+                        product.stock -= item.quantity
+                        product.is_active = product.stock > 0
+                        product.in_stock = product.stock > 0
 
-    if qr_token:
-        # Отправляем новое сообщение с фото QR
-        await context.bot.send_photo(
-            chat_id=query.message.chat_id,
-            photo=qr_token,
-            caption=text,
-            reply_markup=kb,
-            parse_mode=ParseMode.MARKDOWN
+            order.status = OrderStatus.pending
+            await session.commit()
+            invalidate_catalog_cache()
+            cart_text = format_cart(order)
+
+        # 3. Отправка фото с QR
+        text = (
+            f"✅ **Заказ #{order.id} оформлен!**\n\n"
+            f"{cart_text}\n\n"
+            "После оплаты нажмите кнопку ниже и пришлите фото чека."
         )
-        # Удаляем предыдущее сообщение (с кнопкой подтверждения)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Я оплатил — отправить чек", callback_data=f"payment:receipt:{order.id}")],
+            [InlineKeyboardButton("❌ Отменить заказ", callback_data=f"payment:cancel:{order.id}")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
+        ])
+
+        for attempt in range(3):
+            try:
+                await context.bot.send_photo(
+                    chat_id=query.message.chat_id,
+                    photo=qr_telegram,  # <-- здесь было qr_token, исправлено на qr_telegram
+                    caption=text,
+                    reply_markup=kb,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                break
+            except Exception as e:
+                logger.warning(f"Отправка QR фото, попытка {attempt+1}: {e}")
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.5)
+
         try:
             await query.message.delete()
         except Exception:
             pass
-    else:
-        await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
+        logger.info("order confirmed", extra={"event": "order_confirmed", "user_id": user_id, "order_id": order.id})
+
+    except Exception as e:
+        logger.exception(f"Ошибка при подтверждении заказа: {e}")
+        await query.edit_message_text(
+            "⚠️ Произошла ошибка при оформлении заказа. Попробуйте ещё раз или обратитесь к администратору.",
+            reply_markup=kb_back_to_menu()
+        )
 
 
 def register(app):
+    """Регистрирует обработчики корзины."""
     app.add_handler(CallbackQueryHandler(view_cart, pattern='^cart:view$'))
     app.add_handler(CallbackQueryHandler(cart_remove_choose, pattern='^cart:remove:'))
     app.add_handler(CallbackQueryHandler(cart_delete_item, pattern='^cart:del_item:'))

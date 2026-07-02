@@ -32,6 +32,7 @@ async def payment_receipt_start(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена заказа клиентом. Разрешена для статусов pending и paid (до подтверждения)."""
     query = update.callback_query
     await query.answer()
     order_id = int(query.data.split(":")[-1])
@@ -43,82 +44,59 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Заказ не найден.")
             return
 
-        # Запрещаем отмену для оплаченных/подтверждённых заказов
-        if order.status == OrderStatus.paid:
+        # Разрешаем отмену только для pending и paid (до подтверждения)
+        if order.status not in (OrderStatus.pending, OrderStatus.paid):
             await query.edit_message_text(
-                "⚠️ Заказ уже оплачен, отмена невозможна.",
+                f"⚠️ Заказ уже подтверждён (статус: {order.status.value}), отмена невозможна.",
                 reply_markup=kb_back_to_menu()
             )
             return
 
-        if order.status == OrderStatus.confirmed:
+        # Возвращаем остатки (если они были списаны)
+        for item in order.items:
+            if item.product and item.product.stock is not None:
+                item.product.stock += item.quantity
+                item.product.is_active = item.product.stock > 0
+                item.product.in_stock = item.product.stock > 0
+
+        # Меняем статус на отменённый
+        order.status = OrderStatus.cancelled
+        await session.commit()
+        invalidate_catalog_cache()
+        fio = order.full_name or (order.user.full_name if order.user else None)
+        logger.info("order cancelled by client",
+                    extra={"event": "order_cancelled", "user_id": user_id,
+                           "order_id": order_id})
+
+        # Уведомление администратора
+        admin_text = f"❌ Клиент отменил заказ #{order_id} на {order.total_amount:.0f} ₽."
+        if fio:
+            admin_text += f"\nФИО: {fio}"
+        try:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_text)
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить администратора об отмене: {e}")
+
+        # Отправляем подтверждение клиенту
+        order_info = format_order_for_admin(order)
+        text = f"❌ **Заказ #{order_id} отменён.**\n\n{order_info}"
+
+        try:
             await query.edit_message_text(
-                "⚠️ Заказ уже подтверждён, отмена невозможна.",
-                reply_markup=kb_back_to_menu()
+                text,
+                reply_markup=kb_back_to_menu(),
+                parse_mode=ParseMode.MARKDOWN
             )
-            return
-
-        # Отмена только для pending заказов младше 5 минут
-        if order.status == OrderStatus.pending:
-            created_at = order.created_at.replace(tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
-            age_seconds = (now - created_at).total_seconds()
-            if age_seconds >= 300:
-                await query.edit_message_text(
-                    "⚠️ С момента оформления заказа прошло более 5 минут. Отмена невозможна.",
-                    reply_markup=kb_back_to_menu()
-                )
-                return
-
-            # Отмена: возвращаем остатки
-            for item in order.items:
-                if item.product and item.product.stock is not None:
-                    item.product.stock += item.quantity
-                    item.product.is_active = item.product.stock > 0
-                    item.product.in_stock = item.product.stock > 0
-            order.status = OrderStatus.cancelled
-            await session.commit()
-            invalidate_catalog_cache()
-            fio = order.full_name or (order.user.full_name if order.user else None)
-            logger.info("order cancelled by client",
-                        extra={"event": "order_cancelled", "user_id": user_id,
-                               "order_id": order_id})
-            # Уведомляем администратора
-            admin_text = f"❌ Клиент отменил заказ #{order_id} на {order.total_amount:.0f} ₽."
-            if fio:
-                admin_text += f"\nФИО: {fio}"
+        except Exception:
             try:
-                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_text)
-            except Exception as e:
-                logger.warning(f"Не удалось уведомить администратора об отмене: {e}")
-
-            # Отправляем подтверждение клиенту — безопасно, удаляя старое сообщение
-                        # Отправляем подтверждение клиенту с деталями заказа
-            order_info = format_order_for_admin(order)
-            text = f"❌ **Заказ #{order_id} отменён.**\n\n{order_info}"
-
-            try:
-                await query.edit_message_text(
-                    text,
-                    reply_markup=kb_back_to_menu(),
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                await query.message.delete()
             except Exception:
-                # Если не удалось отредактировать (например, сообщение с фото), удаляем и отправляем новое
-                try:
-                    await query.message.delete()
-                except Exception:
-                    pass
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=text,
-                    reply_markup=kb_back_to_menu(),
-                    parse_mode=ParseMode.MARKDOWN
-                )
-        else:
-            await query.edit_message_text(
-                "⚠️ Отмена заказа невозможна.",
-                reply_markup=kb_back_to_menu()
+                pass
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=text,
+                reply_markup=kb_back_to_menu(),
+                parse_mode=ParseMode.MARKDOWN
             )
 
 
