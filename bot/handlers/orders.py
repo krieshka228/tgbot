@@ -54,9 +54,7 @@ async def orders_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page: 
         return
 
     total_pages = (total - 1) // ORDERS_PER_PAGE + 1
-    lines = [f"📋 **Ваши заказы** (стр. {page+1}/{total_pages})\n"]
-    now = datetime.now(timezone.utc)
-    CANCEL_TIMEOUT = 300  # 5 минут
+    lines = [f"📋 **Ваши заказы** (стр. {page + 1}/{total_pages})\n"]
 
     for order in orders:
         label = STATUS_LABEL.get(order.status.value, order.status.value)
@@ -71,28 +69,42 @@ async def orders_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page: 
     kb_buttons = []
     for order in orders:
         row = []
-        if order.status == OrderStatus.pending:
-            # Исправление: делаем created_at offset-aware
-            created_at = order.created_at.replace(tzinfo=timezone.utc)
-            age_seconds = (now - created_at).total_seconds()
-            if age_seconds < CANCEL_TIMEOUT:
+
+        # ✅ НОВАЯ ЛОГИКА: кнопка отмены для всех, кроме paid и confirmed
+        if order.status not in (OrderStatus.paid, OrderStatus.confirmed):
+            if order.status == OrderStatus.pending:
+                # Для pending: отмена + оплата
                 row.append(InlineKeyboardButton(
-                    f"❌ Отменить #{order.id}", callback_data=f"payment:cancel:{order.id}"))
-            if qr_token:
+                    f"❌ Отменить #{order.id}", callback_data=f"order:cancel:{order.id}"
+                ))
+                if qr_token:
+                    row.append(InlineKeyboardButton(
+                        f"💳 Оплатить #{order.id}", callback_data=f"payment:receipt:{order.id}"
+                    ))
+            elif order.status == OrderStatus.cancelled:
+                # Для уже отменённых – показываем статус, но не даём отменить
+                pass
+            else:
+                # Для draft, exported, exported – кнопка отмены
                 row.append(InlineKeyboardButton(
-                    f"💳 Оплатить #{order.id}", callback_data=f"payment:receipt:{order.id}"))
+                    f"❌ Отменить #{order.id}", callback_data=f"order:cancel:{order.id}"
+                ))
+
+        # Для confirmed – кнопка дополнить данные
         elif order.status == OrderStatus.confirmed:
             if not order.contact_phone or not order.delivery_address:
                 row.append(InlineKeyboardButton(
-                    f"📝 Дополнить данные #{order.id}", callback_data=f"orders:complete:{order.id}"))
+                    f"📝 Дополнить данные #{order.id}", callback_data=f"orders:complete:{order.id}"
+                ))
+
         if row:
             kb_buttons.append(row)
 
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton("← Назад", callback_data=f"orders:page:{page-1}"))
+        nav_buttons.append(InlineKeyboardButton("← Назад", callback_data=f"orders:page:{page - 1}"))
     if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Вперёд →", callback_data=f"orders:page:{page+1}"))
+        nav_buttons.append(InlineKeyboardButton("Вперёд →", callback_data=f"orders:page:{page + 1}"))
     if nav_buttons:
         kb_buttons.append(nav_buttons)
 
@@ -100,7 +112,6 @@ async def orders_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page: 
     keyboard = InlineKeyboardMarkup(kb_buttons)
 
     await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
-
 
 async def orders_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик переключения страниц."""
@@ -146,7 +157,73 @@ async def orders_complete_data(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(prompt, reply_markup=kb_back_to_menu())
 
 
+async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена заказа пользователем (для всех статусов, кроме paid и confirmed)."""
+    query = update.callback_query
+    await query.answer()
+
+    order_id = int(query.data.split(":")[-1])
+    user_id = query.from_user.id
+
+    async for session in get_session():
+        order = await get_order_with_items(session, order_id)
+        if not order or order.user_id != user_id:
+            await query.edit_message_text("❌ Заказ не найден.", reply_markup=kb_back_to_menu())
+            return
+
+        # ❌ НЕЛЬЗЯ ОТМЕНИТЬ ТОЛЬКО ОПЛАЧЕННЫЕ И ПОДТВЕРЖДЁННЫЕ
+        if order.status in (OrderStatus.paid, OrderStatus.confirmed):
+            await query.edit_message_text(
+                f"❌ Нельзя отменить заказ в статусе «{order.status.value}».",
+                reply_markup=kb_back_to_menu()
+            )
+            return
+
+        # Если заказ уже отменён
+        if order.status == OrderStatus.cancelled:
+            await query.edit_message_text(
+                f"ℹ️ Заказ #{order_id} уже был отменён.",
+                reply_markup=kb_back_to_menu()
+            )
+            return
+
+        # Возвращаем остатки товаров (если они были списаны)
+        for item in order.items:
+            if item.product and item.product.stock is not None:
+                item.product.stock += item.quantity
+                item.product.is_active = item.product.stock > 0
+                item.product.in_stock = item.product.stock > 0
+
+        order.status = OrderStatus.cancelled
+        await session.commit()
+        from bot.db import invalidate_catalog_cache
+        invalidate_catalog_cache()
+
+        # Уведомляем администратора
+        from bot.config import ADMIN_CHAT_ID
+        fio = order.full_name or (order.user.full_name if order.user else None)
+        admin_text = f"❌ Клиент отменил заказ #{order_id} на {order.total_amount:.0f} ₽."
+        if fio:
+            admin_text += f"\nФИО: {fio}"
+        try:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_text)
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить администратора об отмене: {e}")
+
+    # Отправляем подтверждение
+    from bot.keyboards import kb_main_menu
+    is_admin = (user_id == ADMIN_USER_ID)
+    await query.edit_message_text(
+        f"✅ Заказ #{order_id} успешно отменён.\n\nТовары возвращены на склад.",
+        reply_markup=kb_main_menu(is_admin=is_admin),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    logger.info("order cancelled by client",
+                extra={"event": "order_cancelled", "user_id": user_id, "order_id": order_id})
+
 def register(app):
     app.add_handler(CallbackQueryHandler(orders_list, pattern='^orders:list$'))
     app.add_handler(CallbackQueryHandler(orders_page_handler, pattern='^orders:page:'))
     app.add_handler(CallbackQueryHandler(orders_complete_data, pattern='^orders:complete:'))
+    app.add_handler(CallbackQueryHandler(cancel_order, pattern='^order:cancel:'))
