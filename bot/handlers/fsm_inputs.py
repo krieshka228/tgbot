@@ -796,7 +796,6 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     parts = query.data.split(":")
-    # формат: porder:confirm:product_id:qty
     product_id = int(parts[2])
     qty = int(parts[3])
     user_id = query.from_user.id
@@ -809,8 +808,9 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("⚠️ QR-код не задан. Загрузите его в админ‑меню.")
             else:
                 await query.edit_message_text("⚠️ Бот временно недоступен.")
-            # Удаляем PendingOrder
-            pending = await session.get(PendingOrder, user_id)
+            # ✅ ИСПРАВЛЕНО: ищем по user_id
+            stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
+            pending = (await session.execute(stmt)).scalar_one_or_none()
             if pending:
                 if pending.confirmation_msg_id:
                     try:
@@ -826,11 +826,12 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         break
 
     async for session in get_session():
-        # Получаем товар с блокировкой (для избежания гонок)
         product = await session.get(Product, product_id)
         if not product or not product.is_active:
             await query.edit_message_text("❌ Товар недоступен.")
-            pending = await session.get(PendingOrder, user_id)
+            # ✅ ИСПРАВЛЕНО: ищем по user_id
+            stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
+            pending = (await session.execute(stmt)).scalar_one_or_none()
             if pending:
                 if pending.confirmation_msg_id:
                     try:
@@ -846,17 +847,16 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('state', None)
             return
 
-        # Проверяем остаток
         if product.stock is not None and qty > product.stock:
-            # Недостаточно товара — пишем в ЛС, что доступно только X
             await query.edit_message_text(
                 f"❌ Недостаточно товара. Доступно только {product.stock} шт.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
                 ])
             )
-            # Удаляем PendingOrder
-            pending = await session.get(PendingOrder, user_id)
+            # ✅ ИСПРАВЛЕНО: ищем по user_id
+            stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
+            pending = (await session.execute(stmt)).scalar_one_or_none()
             if pending:
                 if pending.confirmation_msg_id:
                     try:
@@ -872,13 +872,11 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('state', None)
             return
 
-        # Резервируем товар: списываем остаток
         if product.stock is not None:
             product.stock -= qty
             product.is_active = product.stock > 0
             product.in_stock = product.stock > 0
 
-        # Создаём заказ из корзины
         from bot.db import get_or_create_draft, add_item_to_order
         order = await get_or_create_draft(session, user_id)
         stmt = select(Order).where(Order.id == order.id).options(
@@ -892,8 +890,9 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         invalidate_catalog_cache()
         cart_text = format_cart(order)
 
-        # Удаляем PendingOrder и сообщение с кнопками
-        pending = await session.get(PendingOrder, user_id)
+        # ✅ ИСПРАВЛЕНО: ищем по user_id
+        stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
+        pending = (await session.execute(stmt)).scalar_one_or_none()
         if pending:
             if pending.confirmation_msg_id:
                 try:
@@ -906,7 +905,6 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await session.delete(pending)
             await session.commit()
 
-    # QR-код (вне сессии)
     qr_file_id = None
     async for session in get_session():
         qr_file_id = await get_bot_setting(session, "payment_qr_telegram")
@@ -945,7 +943,9 @@ async def porder_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
     async for session in get_session():
-        pending = await session.get(PendingOrder, user_id)
+        # ✅ ИСПРАВЛЕНО: ищем по user_id
+        stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
+        pending = (await session.execute(stmt)).scalar_one_or_none()
         if pending:
             if pending.confirmation_msg_id:
                 try:

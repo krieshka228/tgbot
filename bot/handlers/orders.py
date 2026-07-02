@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
-
+from bot.config import ADMIN_USER_ID, ADMIN_CHAT_ID
 from bot.db import get_session, OrderStatus, Order, OrderItem, get_order_with_items, get_bot_setting
 from bot.keyboards import kb_back_to_menu, kb_payment
 from bot.utils import escape_markdown
@@ -196,11 +196,9 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         order.status = OrderStatus.cancelled
         await session.commit()
-        from bot.db import invalidate_catalog_cache
         invalidate_catalog_cache()
 
         # Уведомляем администратора
-        from bot.config import ADMIN_CHAT_ID
         fio = order.full_name or (order.user.full_name if order.user else None)
         admin_text = f"❌ Клиент отменил заказ #{order_id} на {order.total_amount:.0f} ₽."
         if fio:
@@ -211,7 +209,6 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Не удалось уведомить администратора об отмене: {e}")
 
     # Отправляем подтверждение
-    from bot.keyboards import kb_main_menu
     is_admin = (user_id == ADMIN_USER_ID)
     await query.edit_message_text(
         f"✅ Заказ #{order_id} успешно отменён.\n\nТовары возвращены на склад.",
@@ -221,7 +218,6 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info("order cancelled by client",
                 extra={"event": "order_cancelled", "user_id": user_id, "order_id": order_id})
-
 def register(app):
     app.add_handler(CallbackQueryHandler(orders_list, pattern='^orders:list$'))
     app.add_handler(CallbackQueryHandler(orders_page_handler, pattern='^orders:page:'))
