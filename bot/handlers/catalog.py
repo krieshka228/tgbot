@@ -401,7 +401,7 @@ async def show_products_page(query, context, page: int = 0):
 
     if subcategory:
         products_all = [p for p in all_products
-                        if p.name == subcategory or p.name.startswith(subcategory + ",")]
+                        if _subcategory_of(p) == subcategory]
     else:
         products_all = all_products
 
