@@ -4,6 +4,7 @@ handlers/posts.py — синхронизация постов канала с б
 import asyncio
 import logging
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -13,8 +14,11 @@ from telegram import (
 from telegram.ext import ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
 from bot.config import ADMIN_CHAT_ID, CHANNEL_ID, DISCUSSION_GROUP_ID
-from bot.db import Comment, get_session, upsert_product, Product, PendingOrder, get_bot_setting
-from bot.utils import parse_post_product, parse_quantity, escape_markdown
+from bot.db import (
+    Comment, get_session, upsert_product, Product, PendingOrder, get_bot_setting,
+    Order, OrderItem, get_or_create_draft, add_item_to_order
+)
+from bot.utils import parse_post_product, parse_quantity, escape_markdown, format_cart
 from bot.utils import upload_photo_to_max, upload_video_to_max
 
 logger = logging.getLogger(__name__)
@@ -92,6 +96,8 @@ async def _sync_post(message, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         logger.info(f"product saved with post_id={post_id}, max_photo_ids={max_photo_ids}, max_video_ids={max_video_ids}")
         logger.info(f"Товар обновлён: {name} | арт={article} | цена={price}₽")
+
+
 async def process_media_group(context: ContextTypes.DEFAULT_TYPE, group_id: str):
     """Обрабатывает собранную медиагруппу из канала."""
     await asyncio.sleep(1)
@@ -158,6 +164,7 @@ async def process_media_group(context: ContextTypes.DEFAULT_TYPE, group_id: str)
         logger.info(f"product saved with post_id={post_id}, max_photo_ids={max_photo_ids}, max_video_ids={max_video_ids}")
         logger.info(f"Товар из альбома обновлён: {name} | арт={article} | цена={price}₽")
 
+
 async def catch_all_channel_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик всех канальных постов с поддержкой медиагрупп."""
     msg = update.channel_post or update.edited_channel_post
@@ -203,6 +210,7 @@ async def catch_all_channel_posts(update: Update, context: ContextTypes.DEFAULT_
     tasks[group_id] = asyncio.create_task(
         process_media_group(context, group_id)
     )
+
 
 def _resolve_post_id(message) -> str | None:
     """Определяет id поста КАНАЛА (Product.post_id) по комментарию в группе.
@@ -371,54 +379,65 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         extra={"product_id": product.id, "qty": qty, "stock": product.stock})
             return
 
-        # 8. Отправка/обновление подтверждения в личку
+        # 8. Добавление в корзину и отправка/обновление подтверждения
         try:
-            total = product.price * qty
+            # Получаем или создаём корзину (draft order)
+            order = await get_or_create_draft(session, user_id)
+            # Загружаем позиции заказа
+            stmt_order = select(Order).where(Order.id == order.id).options(
+                selectinload(Order.items).selectinload(OrderItem.product)
+            )
+            order = (await session.execute(stmt_order)).scalar_one()
+
+            # Добавляем товар в корзину
+            await add_item_to_order(session, order, product, qty)
+            # Обновляем order для актуальных данных
+            order = (await session.execute(stmt_order)).scalar_one()
+
+            # Формируем текст с корзиной
+            cart_text = format_cart(order)
             text_msg = (
-                f"🛒 **Ваш заказ:**\n"
-                f"• {escape_markdown(product.name)} — {qty} шт. × {product.price:.0f} ₽ = {total:.0f} ₽\n\n"
+                f"🛒 **Ваша корзина:**\n\n"
+                f"{cart_text}\n\n"
                 f"Подтвердить заказ?"
             )
+
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Подтвердить", callback_data=f"porder:confirm:{product.id}:{qty}")],
-                [InlineKeyboardButton("❌ Отменить", callback_data="porder:cancel")]
+                [InlineKeyboardButton("✅ Подтвердить заказ", callback_data="porder:confirm")],
+                [InlineKeyboardButton("❌ Отменить заказ", callback_data="porder:cancel")]
             ])
 
-            # Получаем или создаём запись PendingOrder для этого пользователя
+            # Проверяем существующую запись PendingOrder
             stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
             existing_pending = (await session.execute(stmt)).scalar_one_or_none()
 
-            # Если есть существующая запись, обновляем её
-            if existing_pending:
-                # Если есть confirmation_msg_id, редактируем сообщение
-                if existing_pending.confirmation_msg_id:
-                    try:
-                        await context.bot.edit_message_text(
-                            chat_id=user_id,
-                            message_id=existing_pending.confirmation_msg_id,
-                            text=text_msg,
-                            reply_markup=kb,
-                            parse_mode="Markdown"
-                        )
-                        # Обновляем поля
-                        existing_pending.product_id = product.id
-                        existing_pending.quantity = qty
-                        await session.commit()
-                        logger.info("confirmation message edited", extra={"user_id": user_id, "product_id": product.id})
-                        await message.delete()
-                        return
-                    except Exception as e:
-                        logger.warning(f"Failed to edit confirmation message: {e}")
-                        # Если редактирование не удалось, удаляем старую запись и создадим новую
-                        await session.delete(existing_pending)
-                        await session.commit()
-                        # Далее создадим новую запись (продолжим как для нового)
-                else:
-                    # Есть запись, но нет ID сообщения — удалим и создадим заново
+            if existing_pending and existing_pending.confirmation_msg_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=existing_pending.confirmation_msg_id,
+                        text=text_msg,
+                        reply_markup=kb,
+                        parse_mode="Markdown"
+                    )
+                    # Обновляем запись (product_id и quantity не используются, но можно обновить)
+                    existing_pending.product_id = product.id
+                    existing_pending.quantity = qty
+                    await session.commit()
+                    logger.info("confirmation message updated", extra={"user_id": user_id})
+                    await message.delete()
+                    return
+                except Exception as e:
+                    logger.warning(f"Failed to edit message: {e}")
+                    await session.delete(existing_pending)
+                    await session.commit()
+                    # Продолжим и создадим новое сообщение
+            else:
+                if existing_pending:
                     await session.delete(existing_pending)
                     await session.commit()
 
-            # Создаём новое сообщение
+            # Отправляем новое сообщение
             sent = await context.bot.send_message(
                 chat_id=user_id,
                 text=text_msg,
@@ -426,7 +445,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
 
-            # Создаём новую запись
+            # Создаём запись PendingOrder с ID сообщения
             pending = PendingOrder(
                 user_id=user_id,
                 product_id=product.id,
@@ -436,30 +455,30 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.add(pending)
             await session.commit()
 
-            logger.info("confirmation sent", extra={"user_id": user_id, "product_id": product.id})
+            logger.info("new confirmation sent", extra={"user_id": user_id})
             await message.delete()
             return
 
         except Exception as e:
-            logger.warning(f"DM failed for user {user_id}: {e}")
-            # Откатываем транзакцию, если была ошибка
+            logger.warning(f"Failed to process order: {e}")
             await session.rollback()
-            # Пытаемся сохранить PendingOrder без сообщения (пользователь получит уведомление позже)
+            # Сохраняем PendingOrder без ID сообщения, чтобы пользователь мог подтвердить через /start
             stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
             existing = (await session.execute(stmt)).scalar_one_or_none()
             if existing:
                 existing.product_id = product.id
                 existing.quantity = qty
-                # confirmation_msg_id оставляем старый
             else:
                 pending = PendingOrder(user_id=user_id, product_id=product.id, quantity=qty)
                 session.add(pending)
             await session.commit()
             await message.reply_text(
-                f"✅ Ваш заказ на {product.name} (×{qty}) принят. Напишите /start, чтобы подтвердить."
+                f"✅ Товар добавлен в корзину. Напишите /start, чтобы подтвердить заказ."
             )
             await message.delete()
             return
+
+
 def register(app):
     # Универсальный обработчик для канала
     app.add_handler(MessageHandler(
