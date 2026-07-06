@@ -371,7 +371,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         extra={"product_id": product.id, "qty": qty, "stock": product.stock})
             return
 
-        # ======== 8. Отправка/обновление подтверждения в личку (ИСПРАВЛЕНО) ========
+        # 8. Отправка/обновление подтверждения в личку
         try:
             total = product.price * qty
             text_msg = (
@@ -384,58 +384,76 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("❌ Отменить", callback_data="porder:cancel")]
             ])
 
-            # Проверяем, есть ли уже существующее сообщение для этого пользователя
+            # Получаем или создаём запись PendingOrder для этого пользователя
             stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
             existing_pending = (await session.execute(stmt)).scalar_one_or_none()
 
-            if existing_pending and existing_pending.confirmation_msg_id:
-                # Редактируем существующее сообщение
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=user_id,
-                        message_id=existing_pending.confirmation_msg_id,
-                        text=text_msg,
-                        reply_markup=kb,
-                        parse_mode="Markdown"
-                    )
-                    sent = None
-                    logger.info("confirmation message edited", extra={"user_id": user_id, "product_id": product.id})
-                except Exception as e:
-                    logger.warning(f"Failed to edit confirmation message: {e}")
-                    # Если редактирование не удалось — отправляем новое
-                    sent = await context.bot.send_message(
-                        chat_id=user_id,
-                        text=text_msg,
-                        reply_markup=kb,
-                        parse_mode="Markdown"
-                    )
-            else:
-                # Отправляем новое сообщение
-                sent = await context.bot.send_message(
-                    chat_id=user_id,
-                    text=text_msg,
-                    reply_markup=kb,
-                    parse_mode="Markdown"
-                )
+            # Если есть существующая запись, обновляем её
+            if existing_pending:
+                # Если есть confirmation_msg_id, редактируем сообщение
+                if existing_pending.confirmation_msg_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=user_id,
+                            message_id=existing_pending.confirmation_msg_id,
+                            text=text_msg,
+                            reply_markup=kb,
+                            parse_mode="Markdown"
+                        )
+                        # Обновляем поля
+                        existing_pending.product_id = product.id
+                        existing_pending.quantity = qty
+                        await session.commit()
+                        logger.info("confirmation message edited", extra={"user_id": user_id, "product_id": product.id})
+                        await message.delete()
+                        return
+                    except Exception as e:
+                        logger.warning(f"Failed to edit confirmation message: {e}")
+                        # Если редактирование не удалось, удаляем старую запись и создадим новую
+                        await session.delete(existing_pending)
+                        await session.commit()
+                        # Далее создадим новую запись (продолжим как для нового)
+                else:
+                    # Есть запись, но нет ID сообщения — удалим и создадим заново
+                    await session.delete(existing_pending)
+                    await session.commit()
 
-            # Сохраняем или обновляем PendingOrder с ID сообщения
+            # Создаём новое сообщение
+            sent = await context.bot.send_message(
+                chat_id=user_id,
+                text=text_msg,
+                reply_markup=kb,
+                parse_mode="Markdown"
+            )
+
+            # Создаём новую запись
             pending = PendingOrder(
                 user_id=user_id,
                 product_id=product.id,
                 quantity=qty,
-                confirmation_msg_id=sent.message_id if sent else existing_pending.confirmation_msg_id,
+                confirmation_msg_id=sent.message_id,
             )
-            await session.merge(pending)
+            session.add(pending)
             await session.commit()
 
-            logger.info("confirmation sent/updated", extra={"user_id": user_id, "product_id": product.id})
+            logger.info("confirmation sent", extra={"user_id": user_id, "product_id": product.id})
             await message.delete()
             return
 
         except Exception as e:
             logger.warning(f"DM failed for user {user_id}: {e}")
-            pending = PendingOrder(user_id=user_id, product_id=product.id, quantity=qty)
-            await session.merge(pending)
+            # Откатываем транзакцию, если была ошибка
+            await session.rollback()
+            # Пытаемся сохранить PendingOrder без сообщения (пользователь получит уведомление позже)
+            stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
+            existing = (await session.execute(stmt)).scalar_one_or_none()
+            if existing:
+                existing.product_id = product.id
+                existing.quantity = qty
+                # confirmation_msg_id оставляем старый
+            else:
+                pending = PendingOrder(user_id=user_id, product_id=product.id, quantity=qty)
+                session.add(pending)
             await session.commit()
             await message.reply_text(
                 f"✅ Ваш заказ на {product.name} (×{qty}) принят. Напишите /start, чтобы подтвердить."
