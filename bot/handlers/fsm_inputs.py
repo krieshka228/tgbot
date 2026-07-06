@@ -792,125 +792,65 @@ async def process_direct_order(message, text, context):
     return True
 
 async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждение отложенного заказа из комментария."""
+    """Подтверждение заказа из корзины (кнопка из ЛС)."""
     query = update.callback_query
     await query.answer()
-    parts = query.data.split(":")
-    # формат: porder:confirm:product_id:qty
-    product_id = int(parts[2])
-    qty = int(parts[3])
+
     user_id = query.from_user.id
 
-    # Проверяем наличие QR-кода
     async for session in get_session():
-        token = await get_bot_setting(session, "payment_qr_token")
-        if not token:
-            if user_id == ADMIN_USER_ID:
-                await query.edit_message_text("⚠️ QR-код не задан. Загрузите его в админ‑меню.")
-            else:
-                await query.edit_message_text("⚠️ Бот временно недоступен.")
-            # Удаляем PendingOrder
-            pending = await session.get(PendingOrder, user_id)
-            if pending:
-                if pending.confirmation_msg_id:
-                    try:
-                        await context.bot.delete_message(
-                            chat_id=user_id,
-                            message_id=pending.confirmation_msg_id
-                        )
-                    except Exception:
-                        pass
-                await session.delete(pending)
-                await session.commit()
-            return
-        break
+        # Получаем корзину (draft order) пользователя
+        from bot.db import get_draft_order, get_order_with_items, OrderStatus
 
-    async for session in get_session():
-        # Получаем товар с блокировкой (для избежания гонок)
-        product = await session.get(Product, product_id)
-        if not product or not product.is_active:
-            await query.edit_message_text("❌ Товар недоступен.")
-            pending = await session.get(PendingOrder, user_id)
-            if pending:
-                if pending.confirmation_msg_id:
-                    try:
-                        await context.bot.delete_message(
-                            chat_id=user_id,
-                            message_id=pending.confirmation_msg_id
-                        )
-                    except Exception:
-                        pass
-                await session.delete(pending)
-                await session.commit()
-            context.user_data.pop('pending_order', None)
-            context.user_data.pop('state', None)
-            return
-
-        # Проверяем остаток
-        if product.stock is not None and qty > product.stock:
-            # Недостаточно товара — пишем в ЛС, что доступно только X
+        order = await get_draft_order(session, user_id)
+        if not order or not order.items:
             await query.edit_message_text(
-                f"❌ Недостаточно товара. Доступно только {product.stock} шт.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
-                ])
+                "🛒 Ваша корзина пуста. Добавьте товары через комментарии к постам.",
+                reply_markup=kb_main_menu(is_admin=(user_id == ADMIN_USER_ID))
             )
-            # Удаляем PendingOrder
-            pending = await session.get(PendingOrder, user_id)
-            if pending:
-                if pending.confirmation_msg_id:
-                    try:
-                        await context.bot.delete_message(
-                            chat_id=user_id,
-                            message_id=pending.confirmation_msg_id
-                        )
-                    except Exception:
-                        pass
-                await session.delete(pending)
-                await session.commit()
-            context.user_data.pop('pending_order', None)
-            context.user_data.pop('state', None)
             return
 
-        # Резервируем товар: списываем остаток
-        if product.stock is not None:
-            product.stock -= qty
-            product.is_active = product.stock > 0
-            product.in_stock = product.stock > 0
+        # Проверяем наличие QR-кода
+        qr_telegram = await get_bot_setting(session, "payment_qr_telegram")
+        if not qr_telegram:
+            await query.edit_message_text(
+                "⚠️ Оплата временно недоступна. Попробуйте позже.",
+                reply_markup=kb_main_menu(is_admin=(user_id == ADMIN_USER_ID))
+            )
+            return
 
-        # Создаём заказ из корзины
-        from bot.db import get_or_create_draft, add_item_to_order
-        order = await get_or_create_draft(session, user_id)
-        stmt = select(Order).where(Order.id == order.id).options(
-            selectinload(Order.items).selectinload(OrderItem.product)
-        )
-        order = (await session.execute(stmt)).scalar_one()
-        await add_item_to_order(session, order, product, qty)
-        order = (await session.execute(stmt)).scalar_one()
+        # Проверяем остатки по каждому товару
+        for item in order.items:
+            product = item.product
+            if product and product.stock is not None and item.quantity > product.stock:
+                await query.edit_message_text(
+                    f"❌ Недостаточно товара «{product.name}». Доступно: {product.stock} шт.",
+                    reply_markup=kb_main_menu(is_admin=(user_id == ADMIN_USER_ID))
+                )
+                return
+
+        # Списываем остатки (если нужно) и меняем статус
+        for item in order.items:
+            product = item.product
+            if product and product.stock is not None:
+                product.stock -= item.quantity
+                product.is_active = product.stock > 0
+                product.in_stock = product.stock > 0
+
         order.status = OrderStatus.pending
         await session.commit()
         invalidate_catalog_cache()
-        cart_text = format_cart(order)
 
-        # Удаляем PendingOrder и сообщение с кнопками
-        pending = await session.get(PendingOrder, user_id)
+        # Удаляем PendingOrder (если есть)
+        stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
+        pending = (await session.execute(stmt)).scalar_one_or_none()
         if pending:
-            if pending.confirmation_msg_id:
-                try:
-                    await context.bot.delete_message(
-                        chat_id=user_id,
-                        message_id=pending.confirmation_msg_id
-                    )
-                except Exception:
-                    pass
             await session.delete(pending)
             await session.commit()
 
-    # QR-код (вне сессии)
-    qr_file_id = None
-    async for session in get_session():
-        qr_file_id = await get_bot_setting(session, "payment_qr_telegram")
+        cart_text = format_cart(order)
 
+    # Отправляем сообщение с заказом
     text = (
         f"✅ **Заказ #{order.id} оформлен!**\n\n"
         f"{cart_text}\n\n"
@@ -922,47 +862,54 @@ async def porder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
     ])
 
-    if qr_file_id:
-        await context.bot.send_photo(
-            chat_id=query.message.chat_id,
-            photo=qr_file_id,
-            caption=text,
+    # Пытаемся отредактировать текущее сообщение (оно с корзиной)
+    try:
+        await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        # Если не вышло — отправляем новое
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=text,
             reply_markup=kb,
             parse_mode=ParseMode.MARKDOWN
         )
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-    else:
-        await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
     context.user_data.pop('pending_order', None)
     context.user_data.pop('state', None)
 
 async def porder_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена заказа (очистка корзины)."""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+
     async for session in get_session():
-        pending = await session.get(PendingOrder, user_id)
+        from bot.db import get_draft_order, OrderStatus
+
+        order = await get_draft_order(session, user_id)
+        if order:
+            # Удаляем все позиции (каскадное удаление настроено)
+            order.status = OrderStatus.cancelled  # или просто удалить?
+            # Чтобы очистить корзину, можно удалить заказ или его позиции.
+            # Проще удалить все позиции и оставить draft.
+            for item in order.items[:]:
+                await session.delete(item)
+            await session.commit()
+
+        # Удаляем PendingOrder (если есть)
+        stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
+        pending = (await session.execute(stmt)).scalar_one_or_none()
         if pending:
-            if pending.confirmation_msg_id:
-                try:
-                    await context.bot.delete_message(
-                        chat_id=user_id,
-                        message_id=pending.confirmation_msg_id
-                    )
-                except Exception:
-                    pass
             await session.delete(pending)
             await session.commit()
+
+    # Редактируем сообщение
+    await query.edit_message_text(
+        "🛒 Корзина очищена. Добавьте товары через комментарии к постам.",
+        reply_markup=kb_main_menu(is_admin=(user_id == ADMIN_USER_ID))
+    )
     context.user_data.pop('pending_order', None)
     context.user_data.pop('state', None)
-    from bot.handlers.start import get_main_menu_info
-    is_admin = (user_id == ADMIN_USER_ID)
-    text, kb = await get_main_menu_info(is_admin)
-    await query.edit_message_text(text, reply_markup=kb)
 
 async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -1195,6 +1142,6 @@ def register(app):
 
     app.add_handler(CallbackQueryHandler(search_page_handler, pattern='^search:page:'))
     app.add_handler(CallbackQueryHandler(search_select_handler, pattern='^search:select:'))
-    app.add_handler(CallbackQueryHandler(porder_confirm, pattern='^porder:confirm:'))
+    app.add_handler(CallbackQueryHandler(porder_confirm, pattern='^porder:confirm$'))
     app.add_handler(CallbackQueryHandler(porder_cancel, pattern='^porder:cancel$'))
     app.add_handler(CallbackQueryHandler(contact_admin_start, pattern='^contact:admin$'))
