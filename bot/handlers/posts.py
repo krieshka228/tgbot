@@ -341,7 +341,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning("no product for post_id", extra={"post_id": post_id})
             return
 
-        # 3. Сохраняем комментарий (импорт Comment уже есть в начале файла)
+        # 3. Сохраняем комментарий
         session.add(Comment(product_id=product.id, user_id=user_id, text=text))
         await session.commit()
         logger.info("comment saved", extra={"product_id": product.id})
@@ -356,7 +356,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("❌ Этот товар временно недоступен.")
             return
 
-        # 6. Проверка наличия QR-кода (Telegram file_id) – ИСПРАВЛЕНО
+        # 6. Проверка наличия QR-кода (Telegram file_id)
         qr_telegram = await get_bot_setting(session, "payment_qr_telegram")
         if not qr_telegram:
             await message.reply_text("⚠️ Оплата временно недоступна. Попробуйте позже.")
@@ -371,7 +371,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         extra={"product_id": product.id, "qty": qty, "stock": product.stock})
             return
 
-        # 8. Отправка подтверждения в личку
+        # ======== 8. Отправка/обновление подтверждения в личку (ИСПРАВЛЕНО) ========
         try:
             total = product.price * qty
             text_msg = (
@@ -383,15 +383,55 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("✅ Подтвердить", callback_data=f"porder:confirm:{product.id}:{qty}")],
                 [InlineKeyboardButton("❌ Отменить", callback_data="porder:cancel")]
             ])
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=text_msg,
-                reply_markup=kb,
-                parse_mode="Markdown"
+
+            # Проверяем, есть ли уже существующее сообщение для этого пользователя
+            stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
+            existing_pending = (await session.execute(stmt)).scalar_one_or_none()
+
+            if existing_pending and existing_pending.confirmation_msg_id:
+                # Редактируем существующее сообщение
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=existing_pending.confirmation_msg_id,
+                        text=text_msg,
+                        reply_markup=kb,
+                        parse_mode="Markdown"
+                    )
+                    sent = None
+                    logger.info("confirmation message edited", extra={"user_id": user_id, "product_id": product.id})
+                except Exception as e:
+                    logger.warning(f"Failed to edit confirmation message: {e}")
+                    # Если редактирование не удалось — отправляем новое
+                    sent = await context.bot.send_message(
+                        chat_id=user_id,
+                        text=text_msg,
+                        reply_markup=kb,
+                        parse_mode="Markdown"
+                    )
+            else:
+                # Отправляем новое сообщение
+                sent = await context.bot.send_message(
+                    chat_id=user_id,
+                    text=text_msg,
+                    reply_markup=kb,
+                    parse_mode="Markdown"
+                )
+
+            # Сохраняем или обновляем PendingOrder с ID сообщения
+            pending = PendingOrder(
+                user_id=user_id,
+                product_id=product.id,
+                quantity=qty,
+                confirmation_msg_id=sent.message_id if sent else existing_pending.confirmation_msg_id,
             )
-            logger.info("confirmation sent to DM", extra={"user_id": user_id, "product_id": product.id})
+            await session.merge(pending)
+            await session.commit()
+
+            logger.info("confirmation sent/updated", extra={"user_id": user_id, "product_id": product.id})
             await message.delete()
             return
+
         except Exception as e:
             logger.warning(f"DM failed for user {user_id}: {e}")
             pending = PendingOrder(user_id=user_id, product_id=product.id, quantity=qty)
