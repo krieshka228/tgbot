@@ -12,6 +12,7 @@ from bot.utils import escape_markdown
 from bot.config import ADMIN_USER_ID
 from bot.db import get_bot_setting, PendingOrder, Product
 from bot.handlers.catalog import clear_all_catalog_and_order_messages
+from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                            full_name=user.full_name,
                                            username=user.username)
         # Проверка отложенного заказа (если есть)
-        pending = await session.get(PendingOrder, user_id)
+        stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
+        pending = (await session.execute(stmt)).scalar_one_or_none()
         if pending:
             product = await session.get(Product, pending.product_id)
             if product and product.is_active:

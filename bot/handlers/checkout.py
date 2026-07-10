@@ -5,7 +5,7 @@ from telegram.constants import ParseMode
 from bot.db import get_session, get_order_with_items, OrderStatus, invalidate_catalog_cache
 from bot.keyboards import kb_payment, kb_admin_confirm_payment, kb_main_menu, kb_back_to_menu
 from bot.config import ADMIN_USER_ID, ADMIN_CHAT_ID
-from bot.utils import format_order_for_admin, format_cart
+from bot.utils import format_order_for_admin, format_cart, escape_markdown  # <-- только один импорт
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,6 @@ async def payment_receipt_start(update: Update, context: ContextTypes.DEFAULT_TY
     order_id = int(query.data.split(":")[-1])
     context.user_data['state'] = 'awaiting_receipt'
     context.user_data['data'] = {'order_id': order_id}
-    # Безопасное редактирование: если сообщение не текстовое, удаляем и отправляем новое
     try:
         await query.edit_message_text("📷 Пришлите фото или скриншот чека об оплате:")
     except Exception:
@@ -44,7 +43,6 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Заказ не найден.")
             return
 
-        # Разрешаем отмену только для pending и paid (до подтверждения)
         if order.status not in (OrderStatus.pending, OrderStatus.paid):
             await query.edit_message_text(
                 f"⚠️ Заказ уже подтверждён (статус: {order.status.value}), отмена невозможна.",
@@ -52,14 +50,12 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Возвращаем остатки (если они были списаны)
         for item in order.items:
             if item.product and item.product.stock is not None:
                 item.product.stock += item.quantity
                 item.product.is_active = item.product.stock > 0
                 item.product.in_stock = item.product.stock > 0
 
-        # Меняем статус на отменённый
         order.status = OrderStatus.cancelled
         await session.commit()
         invalidate_catalog_cache()
@@ -68,7 +64,6 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra={"event": "order_cancelled", "user_id": user_id,
                            "order_id": order_id})
 
-        # Уведомление администратора
         admin_text = f"❌ Клиент отменил заказ #{order_id} на {order.total_amount:.0f} ₽."
         if fio:
             admin_text += f"\nФИО: {fio}"
@@ -77,10 +72,9 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Не удалось уведомить администратора об отмене: {e}")
 
-        # Отправляем подтверждение клиенту
         order_info = format_order_for_admin(order)
-        text = f"❌ **Заказ #{order_id} отменён.**\n\n{order_info}"
-
+        order_info_escaped = escape_markdown(order_info)
+        text = f"❌ **Заказ #{order_id} отменён.**\n\n{order_info_escaped}"
         try:
             await query.edit_message_text(
                 text,
@@ -129,12 +123,15 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order.receipt_file_id = file_id
         await session.commit()
         order_info = format_order_for_admin(order)
+        order_info_escaped = escape_markdown(order_info)
 
+    # Исправлен синтаксис caption
+    caption = f"💳 **Новый чек об оплате!**\n\n{order_info_escaped}\n\nПроверьте оплату:"
     try:
         await context.bot.send_photo(
             chat_id=ADMIN_CHAT_ID,
             photo=file_id,
-            caption=f"💳 **Новый чек об оплате!**\n\n{order_info}\n\nПроверьте оплату:",
+            caption=caption,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb_admin_confirm_payment(order_id)
         )
@@ -161,7 +158,6 @@ async def admin_pay_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Заказ не найден.")
             return
         order.status = OrderStatus.confirmed
-        # Только обновляем активность товаров, НЕ списываем остатки повторно!
         for item in order.items:
             product = item.product
             if product:
@@ -171,12 +167,10 @@ async def admin_pay_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
         invalidate_catalog_cache()
         client_id = order.user_id
 
-    # Просим клиента ввести телефон
     await context.bot.send_message(
         chat_id=client_id,
         text="📱 Введите ваш номер телефона для связи:"
     )
-    # Безопасное уведомление администратора
     try:
         await query.edit_message_text(f"✅ Оплата заказа #{order_id} подтверждена. Ожидаем телефон от клиента.")
     except Exception:
@@ -188,6 +182,8 @@ async def admin_pay_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=query.message.chat_id,
             text=f"✅ Оплата заказа #{order_id} подтверждена. Ожидаем телефон от клиента."
         )
+
+
 async def admin_pay_fail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -209,7 +205,6 @@ async def admin_pay_fail(update: Update, context: ContextTypes.DEFAULT_TYPE):
              "Проверьте реквизиты и попробуйте снова или напишите администратору.",
         reply_markup=kb_payment(order_id)
     )
-    # Безопасное уведомление админа
     try:
         await query.edit_message_text(f"❌ Оплата заказа #{order_id} отклонена.")
     except Exception:
@@ -222,10 +217,10 @@ async def admin_pay_fail(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=f"❌ Оплата заказа #{order_id} отклонена."
         )
 
+
 def register(app):
     app.add_handler(CallbackQueryHandler(payment_receipt_start, pattern='^payment:receipt:'))
     app.add_handler(CallbackQueryHandler(payment_cancel, pattern='^payment:cancel:'))
     app.add_handler(CallbackQueryHandler(admin_pay_ok, pattern='^admin:pay_ok:'))
     app.add_handler(CallbackQueryHandler(admin_pay_fail, pattern='^admin:pay_fail:'))
-    # block=False разрешает обработку сообщения другими обработчиками, если это не чек
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_receipt, block=False), group=1)
