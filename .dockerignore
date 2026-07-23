@@ -1,0 +1,24 @@
+# Секреты — токен и ID не должны попадать в образ
+.env
+
+# История git (могла содержать секреты в старых коммитах)
+.git/
+.gitignore
+
+# Локальная база данных — в проде используется отдельный volume/DATABASE_URL
+orders.db
+*.db
+
+# Виртуальное окружение и кэш Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+
+Dockerfile
+.dockerignore
+README.md
