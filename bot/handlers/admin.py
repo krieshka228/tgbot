@@ -26,6 +26,61 @@ async def safe_edit(query, text, reply_markup=None, parse_mode=None):
         logger.warning(f"Не удалось отредактировать сообщение: {e}")
 
 
+async def admin_bonus_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню управления бонусами."""
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Начислить бонусы пользователю", callback_data="admin:bonus_add_user")],
+        [InlineKeyboardButton("👥 Начислить бонусы всем", callback_data="admin:bonus_add_all")],
+        [InlineKeyboardButton("👀 Просмотр баланса пользователя", callback_data="admin:bonus_check")],
+        [InlineKeyboardButton("⚙️ Админ-меню", callback_data="admin:menu")]
+    ])
+    await safe_edit(query, "💎 **Управление бонусами**", reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
+
+async def admin_bonus_add_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запуск ввода user_id для начисления бонусов."""
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    context.user_data['state'] = 'admin_bonus_add_user'
+    await safe_edit(query, "✏️ Введите user_id пользователя и сумму бонусов через пробел.\n\nПример: `123456 500`",
+                    reply_markup=kb_back_to_menu(), parse_mode=ParseMode.MARKDOWN)
+
+
+async def admin_bonus_add_all_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запуск массового начисления бонусов всем пользователям."""
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    context.user_data['state'] = 'admin_bonus_add_all'
+    await safe_edit(query, "✏️ Введите сумму бонусов для начисления ВСЕМ пользователям.\n\nПример: `500`",
+                    reply_markup=kb_back_to_menu(), parse_mode=ParseMode.MARKDOWN)
+
+
+async def admin_bonus_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запуск проверки баланса пользователя."""
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    context.user_data['state'] = 'admin_bonus_check'
+    await safe_edit(query, "✏️ Введите user_id пользователя для проверки баланса.\n\nПример: `123456`",
+                    reply_markup=kb_back_to_menu(), parse_mode=ParseMode.MARKDOWN)
+
 async def show_stock_categories(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     query = update.callback_query
     async for session in get_session():
@@ -693,6 +748,9 @@ async def product_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not product:
             await safe_edit(query, "❌ Товар не найден.", reply_markup=kb_admin_menu())
             return
+        # ✅ СНАЧАЛА УДАЛЯЕМ СВЯЗАННЫЕ ПОЗИЦИИ В ЗАКАЗАХ
+        await session.execute(sql_delete(OrderItem).where(OrderItem.product_id == product_id))
+        # ✅ ПОТОМ УДАЛЯЕМ САМ ТОВАР
         await session.delete(product)
         await session.commit()
         invalidate_catalog_cache()
@@ -885,3 +943,8 @@ def register(app):
     app.add_handler(CallbackQueryHandler(product_delete, pattern='^admin:prod_delete:'))
     app.add_handler(CallbackQueryHandler(product_hide, pattern='^admin:prod_hide:'))
     app.add_handler(CallbackQueryHandler(product_show, pattern='^admin:prod_show:'))
+
+    app.add_handler(CallbackQueryHandler(admin_bonus_menu, pattern='^admin:bonus_menu$'))
+    app.add_handler(CallbackQueryHandler(admin_bonus_add_user_start, pattern='^admin:bonus_add_user$'))
+    app.add_handler(CallbackQueryHandler(admin_bonus_add_all_start, pattern='^admin:bonus_add_all$'))
+    app.add_handler(CallbackQueryHandler(admin_bonus_check_start, pattern='^admin:bonus_check$'))

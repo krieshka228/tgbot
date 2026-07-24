@@ -13,7 +13,13 @@ from bot.utils import parse_quantity, _parse_post_link, format_cart, parse_post_
 from bot.validators import normalize_phone, parse_positive_int, parse_non_negative_int
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
-from bot.db import upsert_product
+from bot.db import (
+    get_session, get_or_create_user, get_order_with_items, OrderStatus,
+    Product, Order, OrderItem, PendingOrder, get_bot_setting, set_bot_setting,
+    get_all_active_products, invalidate_catalog_cache,
+    User, get_all_users, upsert_product # <-- добавлено
+)
+from bot.handlers.cart import process_checkout_with_bonus
 from sqlalchemy import delete as sql_delete
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, MessageOriginChannel
 from bot.utils import parse_quantity, _parse_post_link, format_cart, parse_post_product, escape_markdown, upload_photo_to_max, upload_video_to_max
@@ -440,12 +446,29 @@ async def confirm_data_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fio = order.full_name or (user.full_name if user else None)
         full_name = escape_markdown(fio) if fio else 'Без имени'
         address = escape_markdown(order.delivery_address) if order.delivery_address else 'не указан'
-        admin_text = f"📦 **Заказ #{order_id} готов к отправке**\n\n" \
-                     f"👤 Клиент: {full_name} (ID {user.id})\n" \
-                     f"📱 Телефон: {user.phone or 'не указан'}\n" \
-                     f"🚚 Доставка: {order.delivery_method}\n" \
-                     f"📍 Адрес: {address}\n\n" \
-                     f"💰 Итого: {order.total_amount:.0f} ₽"
+        # Формируем список товаров
+        items_lines = []
+        for item in order.items:
+            product = item.product
+            if product:
+                name = escape_markdown(product.name)
+                article = product.article or "—"
+                items_lines.append(
+                    f"  • {name} (арт. {article}) — {item.quantity} шт. × {item.price_at_order:.0f} ₽ = {item.quantity * item.price_at_order:.0f} ₽"
+                )
+            else:
+                items_lines.append(f"  • Товар #{item.product_id} (артикул не найден) — {item.quantity} шт.")
+        items_text = "\n".join(items_lines)
+
+        admin_text = (
+            f"📦 **Заказ #{order_id} готов к отправке**\n\n"
+            f"👤 Клиент: {full_name} (ID {user.id})\n"
+            f"📱 Телефон: {user.phone or 'не указан'}\n"
+            f"🚚 Доставка: {order.delivery_method}\n"
+            f"📍 Адрес: {address}\n\n"
+            f"🛒 **Товары:**\n{items_text}\n\n"
+            f"💰 Итого: {order.total_amount:.0f} ₽"
+        )
         try:
             await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_text, parse_mode=ParseMode.MARKDOWN)
             logger.info("order ready, admin notified",
@@ -510,8 +533,8 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
             )
         return True
 
-    name, article, price, category, description, stock = parse_post_product(text)
-    logger.info(f"🔵 Парсинг: name={name}, article={article}, price={price}, category={category}, stock={stock}")
+    name, article, price, category, description = parse_post_product(text)
+    logger.info(f"🔵 Парсинг: name={name}, article={article}, price={price}, category={category}")
 
     if not name or not article:
         await context.bot.send_message(
@@ -585,8 +608,6 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
             max_video_ids=max_video_ids,
             article=article, category=category,
             description=description,
-            in_stock=(stock is not None and stock > 0),
-            stock=stock,
         )
         logger.info(f"🔵 Товар сохранён: id={product.id}, name={product.name}")
 
@@ -876,6 +897,56 @@ async def porder_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     context.user_data.pop('pending_order', None)
     context.user_data.pop('state', None)
+async def process_admin_delete_by_articles(message, text, context):
+    """Удаление товаров по списку артикулов."""
+    if message.from_user.id != ADMIN_USER_ID:
+        return True
+    articles_input = text.strip()
+    if not articles_input:
+        await message.reply_text("❌ Введите хотя бы один артикул.", reply_markup=kb_back_to_menu())
+        return True
+
+    import re
+    parts = re.split(r'[,\s\n]+', articles_input)
+    articles = [p for p in parts if p]
+
+    deleted_names = []
+    not_found = []
+
+    async for session in get_session():
+        for art in articles:
+            products = (await session.execute(
+                select(Product).where(Product.article == art)
+            )).scalars().all()
+            if products:
+                for product in products:
+                    await session.execute(
+                        sql_delete(OrderItem).where(OrderItem.product_id == product.id)
+                    )
+                    deleted_names.append(product.name)
+                    await session.delete(product)
+            else:
+                not_found.append(art)
+        await session.commit()
+
+    if deleted_names:
+        invalidate_catalog_cache()
+
+    text_parts = []
+    if deleted_names:
+        text_parts.append(f"✅ Удалено товаров: {len(deleted_names)}")
+        for name in deleted_names[:10]:
+            text_parts.append(f"  • {name}")
+        if len(deleted_names) > 10:
+            text_parts.append(f"  … и ещё {len(deleted_names)-10}")
+    if not_found:
+        text_parts.append(f"❌ Не найдено артикулов: {', '.join(not_found)}")
+    if not text_parts:
+        text_parts.append("ℹ️ Ни один товар не удалён.")
+
+    context.user_data.pop('state', None)
+    await message.reply_text("\n".join(text_parts), reply_markup=kb_admin_menu())
+    return True
 
 async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -1020,6 +1091,183 @@ async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE)
         handled = await process_direct_order(message, content_text, context)
         if not handled:
             pass
+
+
+async def process_admin_bonus_add_user(message, text, context):
+    """Начисление бонусов конкретному пользователю."""
+    if message.from_user.id != ADMIN_USER_ID:
+        return True
+
+    parts = text.strip().split()
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].lstrip('-').isdigit():
+        await message.reply_text("❌ Формат: <user_id> <сумма>. Например: 123456 500", reply_markup=kb_admin_menu())
+        context.user_data.pop('state', None)
+        return True
+
+    user_id = int(parts[0])
+    amount = int(parts[1])
+
+    if amount <= 0:
+        await message.reply_text("❌ Сумма бонусов должна быть положительной.", reply_markup=kb_admin_menu())
+        context.user_data.pop('state', None)
+        return True
+
+    async for session in get_session():
+        user = await session.get(User, user_id)
+        if not user:
+            await message.reply_text(f"❌ Пользователь с ID {user_id} не найден.", reply_markup=kb_admin_menu())
+            context.user_data.pop('state', None)
+            return True
+
+        user.bonus_balance = (user.bonus_balance or 0) + amount
+        await session.commit()
+
+        # Отправляем уведомление пользователю
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🎉 **Вам начислено {amount} бонусов!**\n\n"
+                     f"Теперь вы можете оплатить до 20% стоимости любого заказа.\n"
+                     f"💰 Ваш баланс: {user.bonus_balance} бонусов.\n\n"
+                     f"Просто оформите заказ — бот предложит списать бонусы автоматически.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить пользователя {user_id}: {e}")
+
+    await message.reply_text(f"✅ Пользователю {user_id} начислено {amount} бонусов.\n"
+                             f"💰 Новый баланс: {user.bonus_balance} бонусов.",
+                             reply_markup=kb_admin_menu())
+    context.user_data.pop('state', None)
+    return True
+
+
+async def process_admin_bonus_add_all(message, text, context):
+    """Массовое начисление бонусов всем пользователям."""
+    if message.from_user.id != ADMIN_USER_ID:
+        return True
+
+    amount = parse_non_negative_int(text.strip())
+    if amount is None or amount <= 0:
+        await message.reply_text("❌ Введите положительное число.", reply_markup=kb_admin_menu())
+        context.user_data.pop('state', None)
+        return True
+
+    async for session in get_session():
+        users = await get_all_users(session)
+        count = 0
+        for user in users:
+            if user.id != ADMIN_USER_ID:  # Админу не начисляем
+                user.bonus_balance = (user.bonus_balance or 0) + amount
+                count += 1
+                # Можно добавить задержку, чтобы не флудить
+                try:
+                    await context.bot.send_message(
+                        chat_id=user.id,
+                        text=f"🎉 **Вам начислено {amount} бонусов!**\n\n"
+                             f"Теперь вы можете оплатить до 20% стоимости любого заказа.\n"
+                             f"💰 Ваш баланс: {user.bonus_balance} бонусов.\n\n"
+                             f"Просто оформите заказ — бот предложит списать бонусы автоматически.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    pass
+        await session.commit()
+
+    await message.reply_text(f"✅ {count} пользователям начислено по {amount} бонусов.",
+                             reply_markup=kb_admin_menu())
+    context.user_data.pop('state', None)
+    return True
+
+
+async def process_admin_bonus_check(message, text, context):
+    """Проверка баланса пользователя."""
+    if message.from_user.id != ADMIN_USER_ID:
+        return True
+
+    user_id = parse_positive_int(text.strip())
+    if user_id is None:
+        await message.reply_text("❌ Введите корректный user_id.", reply_markup=kb_admin_menu())
+        context.user_data.pop('state', None)
+        return True
+
+    async for session in get_session():
+        user = await session.get(User, user_id)
+        if not user:
+            await message.reply_text(f"❌ Пользователь с ID {user_id} не найден.", reply_markup=kb_admin_menu())
+            context.user_data.pop('state', None)
+            return True
+
+        await message.reply_text(
+            f"👤 Пользователь: {user.full_name or user.username or user_id}\n"
+            f"💎 Баланс бонусов: {user.bonus_balance or 0}",
+            reply_markup=kb_admin_menu()
+        )
+
+    context.user_data.pop('state', None)
+    return True
+
+
+async def process_order_bonus_input(message, text, context):
+    """Обработка ввода суммы бонусов."""
+    data = context.user_data.get('data', {})
+    order_id = data.get('order_id')
+    bonus_balance = data.get('bonus_balance', 0)
+    order_total = data.get('order_total', 0)
+    user_id = message.from_user.id
+
+    bonus_input = parse_non_negative_int(text.strip())
+    if bonus_input is None:
+        await message.reply_text("❌ Введите целое число.", reply_markup=kb_back_to_menu())
+        return True
+
+    max_bonus = min(bonus_balance, int(order_total * 0.2))
+
+    if bonus_input > max_bonus:
+        await message.reply_text(
+            f"❌ Вы можете списать максимум {max_bonus} бонусов.\n"
+            f"Введите сумму до {max_bonus}:",
+            reply_markup=kb_back_to_menu()
+        )
+        return True
+
+    # Удаляем сообщение пользователя с числом
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # Переходим к оформлению заказа с бонусами
+    # Создаём фейковый callback query
+    class FakeQuery:
+        def __init__(self, chat_id, user_id, message_id):
+            self.message = type('obj', (object,), {
+                'chat_id': chat_id,
+                'message_id': message_id,
+                'reply_text': None,
+                'delete': None
+            })()
+            self.from_user = type('obj', (object,), {'id': user_id})()
+
+        async def edit_message_text(self, text, reply_markup=None, parse_mode=None):
+            return await context.bot.edit_message_text(
+                chat_id=self.message.chat_id,
+                message_id=self.message.message_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
+
+        async def answer(self, *args, **kwargs):
+            pass
+
+    fake_query = FakeQuery(message.chat_id, user_id, context.user_data.get('card_msg_id'))
+    await process_checkout_with_bonus(fake_query, context, order_id, user_id, bonus_input)
+
+    context.user_data.pop('state', None)
+    context.user_data.pop('data', None)
+    return True
 
 async def handle_delivery_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query

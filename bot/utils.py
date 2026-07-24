@@ -161,7 +161,7 @@ def format_cart(order) -> str:
 
 
 def format_order_for_admin(order) -> str:
-    """Форматирует информацию о заказе для администратора."""
+    """Форматирует информацию о заказе для администратора с товарами и артикулами."""
     user = order.user
     if user:
         user_info = f"@{user.username}" if user.username else (user.full_name or "Без имени")
@@ -174,11 +174,20 @@ def format_order_for_admin(order) -> str:
 
     fio_line = f"🪪 ФИО: {escape_markdown(fio)}\n" if fio else ""
     address = escape_markdown(order.delivery_address) if order.delivery_address else "не указан"
+
     items_lines = []
     for item in order.items:
-        product_name = escape_markdown(item.product.name) if item.product else f"Товар #{item.product_id}"
-        items_lines.append(f"• {product_name}: {item.quantity} шт. × {item.price_at_order:.0f} ₽")
+        product = item.product
+        if product:
+            name = escape_markdown(product.name)
+            article = product.article or "—"
+            items_lines.append(
+                f"  • {name} (арт. {article}) — {item.quantity} шт. × {item.price_at_order:.0f} ₽ = {item.quantity * item.price_at_order:.0f} ₽"
+            )
+        else:
+            items_lines.append(f"  • Товар #{item.product_id} (артикул не найден) — {item.quantity} шт.")
     items_text = "\n".join(items_lines)
+
     return (
         f"📦 **Заказ #{order.id}**\n"
         f"👤 Клиент: {user_info}\n"

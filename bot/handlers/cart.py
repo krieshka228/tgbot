@@ -253,26 +253,14 @@ async def cart_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Финальное подтверждение заказа с атомарным резервированием и показом QR-кода."""
-    query = update.callback_query
-    await query.answer()
-
-    order_id = int(query.data.split(":")[-1])
-    user_id = query.from_user.id
-
+async def process_checkout_with_bonus(query, context, order_id: int, user_id: int, bonus_amount: int):
+    """Оформление заказа с учётом бонусов."""
     try:
-        # 1. Получаем Telegram file_id QR-кода
+        # 1. Получаем QR-код
         qr_telegram = None
-        for attempt in range(3):
-            try:
-                async for session in get_session():
-                    qr_telegram = await get_bot_setting(session, "payment_qr_telegram")
-                if qr_telegram:
-                    break
-            except Exception as e:
-                logger.warning(f"QR получение, попытка {attempt+1}: {e}")
-                await asyncio.sleep(0.5)
+        async for session in get_session():
+            qr_telegram = await get_bot_setting(session, "payment_qr_telegram")
+            break
 
         if not qr_telegram:
             await query.edit_message_text(
@@ -282,6 +270,138 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # 2. Обработка заказа
+        async for session in get_session():
+            stmt = (
+                select(Order)
+                .where(Order.id == order_id, Order.user_id == user_id)
+                .options(selectinload(Order.items).selectinload(OrderItem.product))
+                .with_for_update()
+            )
+            result = await session.execute(stmt)
+            order = result.scalar_one_or_none()
+
+            if not order:
+                await query.edit_message_text("❌ Заказ не найден.", reply_markup=kb_back_to_menu())
+                return
+
+            if order.status != OrderStatus.draft:
+                # ... обработка статусов ...
+                return
+
+            # 3. Списываем бонусы
+            user = await session.get(User, user_id)
+            if user and bonus_amount > 0:
+                user.bonus_balance = (user.bonus_balance or 0) - bonus_amount
+                order.total_amount -= bonus_amount
+                order.bonus_used = bonus_amount  # добавить поле в Order
+
+            # 4. Остальная логика (списание товаров, статус)
+            order.status = OrderStatus.pending
+            await session.commit()
+            invalidate_catalog_cache()
+            cart_text = format_cart(order)
+
+        # 5. Отправка сообщения с заказом и бонусами
+        bonus_text = f"\n💎 Списано бонусов: {bonus_amount}" if bonus_amount > 0 else ""
+        text = (
+            f"✅ **Заказ #{order.id} оформлен!**\n\n"
+            f"{cart_text}\n"
+            f"{bonus_text}\n\n"
+            "После оплаты нажмите кнопку ниже и пришлите фото чека."
+        )
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Я оплатил — отправить чек", callback_data=f"payment:receipt:{order.id}")],
+            [InlineKeyboardButton("❌ Отменить заказ", callback_data=f"payment:cancel:{order.id}")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
+        ])
+
+        await context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=qr_telegram,
+            caption=text,
+            reply_markup=kb,
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        logger.info("order confirmed with bonus",
+                    extra={"event": "order_confirmed", "user_id": user_id, "order_id": order.id,
+                           "bonus_used": bonus_amount})
+
+    except Exception as e:
+        logger.exception(f"Ошибка при подтверждении заказа: {e}")
+        await query.edit_message_text(
+            "⚠️ Произошла ошибка при оформлении заказа. Попробуйте ещё раз.",
+            reply_markup=kb_back_to_menu()
+        )
+
+
+async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Финальное подтверждение заказа с атомарным резервированием и показом QR-кода."""
+    query = update.callback_query
+    await query.answer()
+
+    order_id = int(query.data.split(":")[-1])
+    user_id = query.from_user.id
+
+    try:
+        # ✅ 1. ПРОВЕРКА БОНУСОВ
+        bonus_balance = 0
+        order_total = 0
+        async for session in get_session():
+            user = await session.get(User, user_id)
+            if user:
+                bonus_balance = user.bonus_balance or 0
+
+            order = await get_draft_order(session, user_id)
+            if order:
+                order_total = order.total_amount
+
+            break
+
+        # Если есть бонусы — запрашиваем сумму списания
+        if bonus_balance > 0 and order_total > 0:
+            context.user_data['state'] = 'order_bonus_input'
+            context.user_data['data'] = {
+                'order_id': order_id,
+                'bonus_balance': bonus_balance,
+                'order_total': order_total,
+            }
+            max_bonus = min(bonus_balance, int(order_total * 0.2))
+            await query.edit_message_text(
+                f"💎 **У вас {bonus_balance} бонусов!**\n\n"
+                f"Вы можете оплатить до 20% стоимости заказа.\n"
+                f"💰 Максимум: {max_bonus} бонусов.\n\n"
+                f"Введите сумму бонусов для списания (или 0, чтобы не использовать):",
+                reply_markup=kb_back_to_menu()
+            )
+            return
+
+        # 2. Получаем Telegram file_id QR-кода (если бонусов нет или их не используют)
+        qr_telegram = None
+        for attempt in range(3):
+            try:
+                async for session in get_session():
+                    qr_telegram = await get_bot_setting(session, "payment_qr_telegram")
+                if qr_telegram:
+                    break
+            except Exception as e:
+                logger.warning(f"QR получение, попытка {attempt + 1}: {e}")
+                await asyncio.sleep(0.5)
+
+        if not qr_telegram:
+            await query.edit_message_text(
+                "⚠️ QR-код не загружен. Обратитесь к администратору.",
+                reply_markup=kb_back_to_menu()
+            )
+            return
+
+        # 3. Обработка заказа
         async for session in get_session():
             stmt = (
                 select(Order)
@@ -312,18 +432,20 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 return
 
+            # 4. Проверяем остатки (если используется логика остатков)
             product_ids = [item.product_id for item in order.items]
             if product_ids:
                 lock_products = select(Product).where(Product.id.in_(product_ids)).with_for_update()
                 locked = (await session.execute(lock_products)).scalars().all()
                 product_map = {p.id: p for p in locked}
 
+            # 5. Меняем статус на pending
             order.status = OrderStatus.pending
             await session.commit()
             invalidate_catalog_cache()
             cart_text = format_cart(order)
 
-        # 3. Отправка фото с QR
+        # 6. Отправка фото с QR
         text = (
             f"✅ **Заказ #{order.id} оформлен!**\n\n"
             f"{cart_text}\n\n"
@@ -339,14 +461,14 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_photo(
                     chat_id=query.message.chat_id,
-                    photo=qr_telegram,  # <-- здесь было qr_token, исправлено на qr_telegram
+                    photo=qr_telegram,
                     caption=text,
                     reply_markup=kb,
                     parse_mode=ParseMode.MARKDOWN
                 )
                 break
             except Exception as e:
-                logger.warning(f"Отправка QR фото, попытка {attempt+1}: {e}")
+                logger.warning(f"Отправка QR фото, попытка {attempt + 1}: {e}")
                 if attempt == 2:
                     raise
                 await asyncio.sleep(0.5)

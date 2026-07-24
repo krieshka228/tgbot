@@ -43,6 +43,7 @@ def kb_admin_menu():
         [InlineKeyboardButton("💳 Реквизиты", callback_data="admin:payment_qr")],
         [InlineKeyboardButton("📦 Управление товарами", callback_data="admin:manage_products")],  # ← переименовано
         [InlineKeyboardButton("🗑 Удалить по артикулам", callback_data="admin:delete_by_articles")],
+        [InlineKeyboardButton("💎 Управление бонусами", callback_data="admin:bonus_menu")],
         [InlineKeyboardButton("🔗 Привязать пост к товару", callback_data="admin:link_post")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
     ])

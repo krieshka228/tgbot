@@ -50,11 +50,6 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        for item in order.items:
-            if item.product and item.product.stock is not None:
-                item.product.stock += item.quantity
-                item.product.is_active = item.product.stock > 0
-                item.product.in_stock = item.product.stock > 0
 
         order.status = OrderStatus.cancelled
         await session.commit()
@@ -158,11 +153,6 @@ async def admin_pay_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Заказ не найден.")
             return
         order.status = OrderStatus.confirmed
-        for item in order.items:
-            product = item.product
-            if product:
-                product.is_active = (product.stock is not None and product.stock > 0)
-                product.in_stock = product.is_active
         await session.commit()
         invalidate_catalog_cache()
         client_id = order.user_id

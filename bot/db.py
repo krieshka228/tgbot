@@ -64,6 +64,7 @@ class User(Base):
     full_name: Mapped[str | None] = mapped_column(String(256))
     phone: Mapped[str | None] = mapped_column(String(32))
     address: Mapped[str | None] = mapped_column(Text)
+    bonus_balance: Mapped[int] = mapped_column(Integer, default=0)
     platform: Mapped[str | None] = mapped_column(String(32), nullable=True)  # "MAX" или "Telegram"
     consented: Mapped[bool] = mapped_column(Boolean, default=False)
     consented_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -100,6 +101,7 @@ class Order(Base):
     delivery_address: Mapped[str | None] = mapped_column(Text)
     contact_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
     full_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    bonus_used: Mapped[int] = mapped_column(Integer, default=0)
     receipt_file_id: Mapped[str | None] = mapped_column(String(512))
     total_amount: Mapped[float] = mapped_column(Float, default=0.0)
     delivery_method: Mapped[str | None] = mapped_column(String(32), nullable=True)

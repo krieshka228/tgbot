@@ -307,8 +307,6 @@ def _product_caption(product: Product) -> str:
     lines = [f"<b>{html.escape(product.name or 'Без названия')}</b>"]
     if product.article:
         lines.append(f"▫️ Артикул: <code>{html.escape(product.article)}</code>")
-    if product.stock is not None:
-        lines.append(f"▫️ На складе: {product.stock} шт.")
     lines.append(f"▫️ Цена: <b>{product.price:.0f} ₽</b>")
     if product.description:
         lines.append("")
