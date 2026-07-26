@@ -175,9 +175,7 @@ async def process_order_qty(message, text, context):
     context.user_data.pop('state', None)
     context.user_data.pop('data', None)
     return True
-
-import datetime
-from datetime import timezone
+from datetime import datetime, timezone
 
 async def process_admin_promo_create(message, text, context):
     """Создание промокода админом."""
