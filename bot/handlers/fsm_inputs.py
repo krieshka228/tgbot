@@ -23,6 +23,10 @@ from bot.handlers.cart import process_checkout_with_bonus
 from sqlalchemy import delete as sql_delete
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, MessageOriginChannel
 from bot.utils import parse_quantity, _parse_post_link, format_cart, parse_post_product, escape_markdown, upload_photo_to_max, upload_video_to_max
+from bot.handlers.admin import admin_bonus_check_do
+from bot.utils import edit_or_send, escape_html
+from bot.db import PromoCode, PromoUsage
+from bot.utils import parse_datetime
 
 MEDIA_GROUP_TIMEOUT = 5
 ITEMS_PER_PAGE = 3
@@ -172,6 +176,115 @@ async def process_order_qty(message, text, context):
     context.user_data.pop('data', None)
     return True
 
+import datetime
+from datetime import timezone
+
+async def process_admin_promo_create(message, text, context):
+    """Создание промокода админом."""
+    if message.from_user.id != ADMIN_USER_ID:
+        return True
+
+    parts = text.strip().split()
+    if len(parts) < 2:
+        await edit_or_send(context, message.chat_id,
+                           "❌ Укажите как минимум код и количество бонусов.\n"
+                           "Формат: КОД КОЛВО_БОНУСОВ [ЛИМИТ_ИСПОЛЬЗОВАНИЙ] [ДАТА_ОКОНЧАНИЯ]\n"
+                           "Пример: SALE500 500 100 2026-12-31",
+                           reply_markup=kb_admin_menu())
+        context.user_data.pop('state', None)
+        return True
+
+    code = parts[0].upper()
+    bonus = parse_positive_int(parts[1])
+    if bonus is None:
+        await edit_or_send(context, message.chat_id, "❌ Неверное количество бонусов.", reply_markup=kb_admin_menu())
+        context.user_data.pop('state', None)
+        return True
+
+    max_uses = None
+    expires_at = None
+
+    # Разбираем третий и четвёртый параметры (могут быть в любом порядке: лимит, дата)
+    remaining = parts[2:]
+    for part in remaining:
+        # пробуем как число лимита
+        limit = parse_positive_int(part)
+        if limit is not None:
+            max_uses = limit
+            continue
+        # пробуем как дату
+        dt = parse_datetime(part)
+        if dt is not None:
+            expires_at = dt
+            continue
+        # если не подошло – ошибка
+        await edit_or_send(context, message.chat_id,
+                           f"❌ Не удалось распознать параметр '{part}'. Ожидается число или дата ДД-ММ-ГГГГ.",
+                           reply_markup=kb_admin_menu())
+        context.user_data.pop('state', None)
+        return True
+
+    async for session in get_session():
+        exists = (await session.execute(
+            select(PromoCode).where(PromoCode.code == code)
+        )).scalar_one_or_none()
+        if exists:
+            await edit_or_send(context, message.chat_id, f"❌ Код {code} уже существует.", reply_markup=kb_admin_menu())
+            context.user_data.pop('state', None)
+            return True
+
+        promo = PromoCode(
+            code=code,
+            bonus_amount=bonus,
+            max_uses=max_uses,
+            expires_at=expires_at,
+            created_by=message.from_user.id
+        )
+        session.add(promo)
+        await session.commit()
+
+    # Формируем сообщение о результате
+    limits = []
+    if max_uses:
+        limits.append(f"лимит {max_uses} активаций")
+    if expires_at:
+        limits.append(f"до {expires_at.strftime('%d.%m.%Y %H:%M')}")
+    extra = ", ".join(limits)
+    msg = f"✅ Промокод <b>{escape_html(code)}</b> создан: {bonus} бонусов"
+    if extra:
+        msg += f" ({extra})"
+
+    await edit_or_send(context, message.chat_id, msg,
+                       reply_markup=kb_admin_menu(), parse_mode=ParseMode.HTML)
+    context.user_data.pop('state', None)
+    return True
+async def bonus_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    is_admin = (user_id == ADMIN_USER_ID)
+
+    async for session in get_session():
+        user = await session.get(User, user_id)
+        bonus = user.bonus_balance if user else 0
+
+    text = f"💎 **Ваши бонусы**\n\n💰 Баланс: {bonus} бонусов.\nВы можете оплатить до 20% стоимости заказа бонусами."
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 Ввести промокод", callback_data="promo:enter")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
+    ])
+    # Используем edit_or_send с правильным reply_markup
+    context.user_data.pop('main_msg_id', None)
+    await edit_or_send(context, query.message.chat_id, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
+async def promo_enter_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало ввода промокода."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['state'] = 'client_promo_enter'
+    await edit_or_send(context, query.message.chat_id,
+                       "🎁 Введите промокод:",
+                       reply_markup=kb_back_to_menu())
 async def process_cart_change_qty(message, text, context):
     data = context.user_data.get('data', {})
     item_id = data.get('item_id')
@@ -897,6 +1010,23 @@ async def porder_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     context.user_data.pop('pending_order', None)
     context.user_data.pop('state', None)
+async def process_admin_promo_delete(message, text, context):
+    if message.from_user.id != ADMIN_USER_ID:
+        return True
+    code = text.strip().upper()
+    async for session in get_session():
+        promo = (await session.execute(
+            select(PromoCode).where(PromoCode.code == code)
+        )).scalar_one_or_none()
+        if not promo:
+            await edit_or_send(context, message.chat_id, f"❌ Промокод {code} не найден.", reply_markup=kb_admin_menu())
+            context.user_data.pop('state', None)
+            return True
+        await session.delete(promo)
+        await session.commit()
+    await edit_or_send(context, message.chat_id, f"✅ Промокод {code} удалён.", reply_markup=kb_admin_menu())
+    context.user_data.pop('state', None)
+    return True
 async def process_admin_delete_by_articles(message, text, context):
     """Удаление товаров по списку артикулов."""
     if message.from_user.id != ADMIN_USER_ID:
@@ -959,10 +1089,8 @@ async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if message.photo:
             file_id = message.photo[-1].file_id
             async for session in get_session():
-                # Сохраняем Telegram file_id для показа в Telegram
                 await set_bot_setting(session, "payment_qr_telegram", file_id)
-                # Загружаем это же фото в Max и сохраняем Max-токен
-                from bot.utils import upload_photo_to_max  # используем существующую функцию
+                from bot.utils import upload_photo_to_max
                 max_token = await upload_photo_to_max(file_id, context.bot)
                 if max_token:
                     await set_bot_setting(session, "payment_qr_token", max_token)
@@ -1032,6 +1160,29 @@ async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await process_admin_delete_by_articles(message, content_text, context)
         return
 
+    # ========== БОНУСЫ ==========
+    if state == 'admin_bonus_add_user':
+        await process_admin_bonus_add_user(message, content_text, context)
+        return
+    if state == 'client_promo_enter':
+        await process_client_promo(message, content_text, context)
+        return
+    if state == 'admin_bonus_add_all':
+        await process_admin_bonus_add_all(message, content_text, context)
+        return
+    if state == 'admin_promo_delete':
+        await process_admin_promo_delete(message, content_text, context)
+        return
+    if state == 'admin_promo_create':
+        await process_admin_promo_create(message, content_text, context)
+        return
+    if state == 'admin_bonus_check':
+        await admin_bonus_check_do(update, context)
+        return
+    if state == 'order_bonus_input':
+        await process_order_bonus_input(message, content_text, context)
+        return
+
     if not content_text:
         return
 
@@ -1092,40 +1243,59 @@ async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not handled:
             pass
 
-
 async def process_admin_bonus_add_user(message, text, context):
-    """Начисление бонусов конкретному пользователю."""
+    """Начисление бонусов пользователю по @username."""
     if message.from_user.id != ADMIN_USER_ID:
         return True
 
     parts = text.strip().split()
-    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].lstrip('-').isdigit():
-        await message.reply_text("❌ Формат: <user_id> <сумма>. Например: 123456 500", reply_markup=kb_admin_menu())
+    if len(parts) != 2:
+        await edit_or_send(context, message.chat_id,
+                           "❌ Формат: @username <сумма>. Пример: @durov 500",
+                           reply_markup=kb_admin_menu())
         context.user_data.pop('state', None)
         return True
 
-    user_id = int(parts[0])
-    amount = int(parts[1])
+    raw_username = parts[0]
+    # Убираем ведущую @ если есть
+    username = raw_username.lstrip('@')
+
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        await edit_or_send(context, message.chat_id,
+                           "❌ Сумма должна быть целым числом.",
+                           reply_markup=kb_admin_menu())
+        context.user_data.pop('state', None)
+        return True
 
     if amount <= 0:
-        await message.reply_text("❌ Сумма бонусов должна быть положительной.", reply_markup=kb_admin_menu())
+        await edit_or_send(context, message.chat_id,
+                           "❌ Сумма бонусов должна быть положительной.",
+                           reply_markup=kb_admin_menu())
         context.user_data.pop('state', None)
         return True
 
     async for session in get_session():
-        user = await session.get(User, user_id)
+        # Ищем пользователя по username
+        stmt = select(User).where(User.username == username)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+
         if not user:
-            await message.reply_text(f"❌ Пользователь с ID {user_id} не найден.", reply_markup=kb_admin_menu())
+            await edit_or_send(context, message.chat_id,
+                               f"❌ Пользователь @{username} не найден.",
+                               reply_markup=kb_admin_menu())
             context.user_data.pop('state', None)
             return True
 
         user.bonus_balance = (user.bonus_balance or 0) + amount
         await session.commit()
 
-        # Отправляем уведомление пользователю
+        # Уведомление пользователю
         try:
             await context.bot.send_message(
-                chat_id=user_id,
+                chat_id=user.id,
                 text=f"🎉 **Вам начислено {amount} бонусов!**\n\n"
                      f"Теперь вы можете оплатить до 20% стоимости любого заказа.\n"
                      f"💰 Ваш баланс: {user.bonus_balance} бонусов.\n\n"
@@ -1133,23 +1303,23 @@ async def process_admin_bonus_add_user(message, text, context):
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception as e:
-            logger.warning(f"Не удалось уведомить пользователя {user_id}: {e}")
+            logger.warning(f"Не удалось уведомить @{username}: {e}")
 
-    await message.reply_text(f"✅ Пользователю {user_id} начислено {amount} бонусов.\n"
-                             f"💰 Новый баланс: {user.bonus_balance} бонусов.",
-                             reply_markup=kb_admin_menu())
+    await edit_or_send(context, message.chat_id,
+                       f"✅ Пользователю @{username} начислено {amount} бонусов.\n"
+                       f"💰 Новый баланс: {user.bonus_balance} бонусов.",
+                       reply_markup=kb_admin_menu())
     context.user_data.pop('state', None)
     return True
 
 
 async def process_admin_bonus_add_all(message, text, context):
-    """Массовое начисление бонусов всем пользователям."""
     if message.from_user.id != ADMIN_USER_ID:
         return True
 
     amount = parse_non_negative_int(text.strip())
     if amount is None or amount <= 0:
-        await message.reply_text("❌ Введите положительное число.", reply_markup=kb_admin_menu())
+        await edit_or_send(context, message.chat_id, "❌ Введите положительное число.", reply_markup=kb_admin_menu())
         context.user_data.pop('state', None)
         return True
 
@@ -1157,10 +1327,9 @@ async def process_admin_bonus_add_all(message, text, context):
         users = await get_all_users(session)
         count = 0
         for user in users:
-            if user.id != ADMIN_USER_ID:  # Админу не начисляем
+            if user.id != ADMIN_USER_ID:
                 user.bonus_balance = (user.bonus_balance or 0) + amount
                 count += 1
-                # Можно добавить задержку, чтобы не флудить
                 try:
                     await context.bot.send_message(
                         chat_id=user.id,
@@ -1175,42 +1344,45 @@ async def process_admin_bonus_add_all(message, text, context):
                     pass
         await session.commit()
 
-    await message.reply_text(f"✅ {count} пользователям начислено по {amount} бонусов.",
-                             reply_markup=kb_admin_menu())
+    context.user_data.pop('main_msg_id', None)
+    await edit_or_send(context, message.chat_id,
+                       f"✅ {count} пользователям начислено по {amount} бонусов.",
+                       reply_markup=kb_admin_menu())
     context.user_data.pop('state', None)
     return True
 
 
 async def process_admin_bonus_check(message, text, context):
-    """Проверка баланса пользователя."""
     if message.from_user.id != ADMIN_USER_ID:
         return True
 
     user_id = parse_positive_int(text.strip())
     if user_id is None:
-        await message.reply_text("❌ Введите корректный user_id.", reply_markup=kb_admin_menu())
+        await edit_or_send(context, message.chat_id, "❌ Введите корректный user_id.", reply_markup=kb_admin_menu())
         context.user_data.pop('state', None)
         return True
 
     async for session in get_session():
         user = await session.get(User, user_id)
         if not user:
-            await message.reply_text(f"❌ Пользователь с ID {user_id} не найден.", reply_markup=kb_admin_menu())
+            await edit_or_send(context, message.chat_id, f"❌ Пользователь с ID {user_id} не найден.", reply_markup=kb_admin_menu())
             context.user_data.pop('state', None)
             return True
 
-        await message.reply_text(
-            f"👤 Пользователь: {user.full_name or user.username or user_id}\n"
-            f"💎 Баланс бонусов: {user.bonus_balance or 0}",
-            reply_markup=kb_admin_menu()
-        )
+        from bot.utils import escape_markdown
+        user_display = escape_markdown(user.full_name or user.username or str(user_id))
+
+        context.user_data.pop('main_msg_id', None)
+        await edit_or_send(context, message.chat_id,
+                           f"👤 Пользователь: {user_display}\n💎 Баланс бонусов: {user.bonus_balance or 0}",
+                           reply_markup=kb_admin_menu(),
+                           parse_mode=ParseMode.MARKDOWN)
 
     context.user_data.pop('state', None)
     return True
 
 
 async def process_order_bonus_input(message, text, context):
-    """Обработка ввода суммы бонусов."""
     data = context.user_data.get('data', {})
     order_id = data.get('order_id')
     bonus_balance = data.get('bonus_balance', 0)
@@ -1219,27 +1391,22 @@ async def process_order_bonus_input(message, text, context):
 
     bonus_input = parse_non_negative_int(text.strip())
     if bonus_input is None:
-        await message.reply_text("❌ Введите целое число.", reply_markup=kb_back_to_menu())
+        await edit_or_send(context, message.chat_id, "❌ Введите целое число.", reply_markup=kb_back_to_menu())
         return True
 
     max_bonus = min(bonus_balance, int(order_total * 0.2))
 
     if bonus_input > max_bonus:
-        await message.reply_text(
-            f"❌ Вы можете списать максимум {max_bonus} бонусов.\n"
-            f"Введите сумму до {max_bonus}:",
-            reply_markup=kb_back_to_menu()
-        )
+        await edit_or_send(context, message.chat_id,
+                           f"❌ Вы можете списать максимум {max_bonus} бонусов.\nВведите сумму до {max_bonus}:",
+                           reply_markup=kb_back_to_menu())
         return True
 
-    # Удаляем сообщение пользователя с числом
     try:
         await message.delete()
     except Exception:
         pass
 
-    # Переходим к оформлению заказа с бонусами
-    # Создаём фейковый callback query
     class FakeQuery:
         def __init__(self, chat_id, user_id, message_id):
             self.message = type('obj', (object,), {
@@ -1289,6 +1456,77 @@ async def handle_delivery_choice(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data['data'] = {'order_id': order_id}
     await query.edit_message_text(f"✅ Выбрана доставка: {delivery_name}\n📍 Теперь введите адрес доставки:",
                                    reply_markup=kb_back_to_menu())
+
+async def process_client_promo(message, text, context):
+    """Активация промокода клиентом."""
+    code = text.strip().upper()
+    user_id = message.from_user.id
+    is_admin = (user_id == ADMIN_USER_ID)
+
+    async for session in get_session():
+        promo = (await session.execute(
+            select(PromoCode).where(PromoCode.code == code)
+        )).scalar_one_or_none()
+
+        if not promo or not promo.is_active:
+            await edit_or_send(context, message.chat_id,
+                               "❌ Промокод не найден или неактивен.",
+                               reply_markup=kb_main_menu(is_admin=is_admin))
+            context.user_data.pop('state', None)
+            return True
+
+        # Проверка срока действия
+        if promo.expires_at:
+            expires_dt = promo.expires_at.replace(
+                tzinfo=timezone.utc) if promo.expires_at.tzinfo is None else promo.expires_at
+            if datetime.now(timezone.utc) > expires_dt:
+                await edit_or_send(context, message.chat_id,
+                                   "❌ Срок действия промокода истёк.",
+                                   reply_markup=kb_main_menu(is_admin=is_admin))
+                context.user_data.pop('state', None)
+                return True
+
+        if promo.max_uses is not None and promo.used_count >= promo.max_uses:
+            await edit_or_send(context, message.chat_id,
+                               "❌ Промокод больше не действует.",
+                               reply_markup=kb_main_menu(is_admin=is_admin))
+            context.user_data.pop('state', None)
+            return True
+
+        # Проверка на повторное использование
+        already_used = (await session.execute(
+            select(PromoUsage).where(
+                PromoUsage.promo_code == code,
+                PromoUsage.user_id == user_id
+            )
+        )).scalar_one_or_none()
+        if already_used:
+            await edit_or_send(context, message.chat_id,
+                               "❌ Вы уже использовали этот промокод.",
+                               reply_markup=kb_main_menu(is_admin=is_admin))
+            context.user_data.pop('state', None)
+            return True
+
+        user = await session.get(User, user_id)
+        if not user:
+            user = User(id=user_id, bonus_balance=0)
+            session.add(user)
+        user.bonus_balance = (user.bonus_balance or 0) + promo.bonus_amount
+        promo.used_count += 1
+
+        session.add(PromoUsage(promo_code=code, user_id=user_id))
+        await session.commit()
+
+        new_balance = user.bonus_balance
+
+    context.user_data.pop('main_msg_id', None)
+    await edit_or_send(context, message.chat_id,
+                       f"✅ Промокод активирован! Вам начислено {promo.bonus_amount} бонусов.\n"
+                       f"💰 Ваш баланс: {new_balance} бонусов.",
+                       reply_markup=kb_main_menu(is_admin=is_admin))
+    context.user_data.pop('state', None)
+    return True
+
 async def contact_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки «Написать администратору»."""
     query = update.callback_query
@@ -1359,3 +1597,6 @@ def register(app):
     app.add_handler(CallbackQueryHandler(porder_confirm, pattern='^porder:confirm$'))
     app.add_handler(CallbackQueryHandler(porder_cancel, pattern='^porder:cancel$'))
     app.add_handler(CallbackQueryHandler(contact_admin_start, pattern='^contact:admin$'))
+
+    app.add_handler(CallbackQueryHandler(bonus_menu, pattern='^bonus:menu$'))
+    app.add_handler(CallbackQueryHandler(promo_enter_start, pattern='^promo:enter$'))

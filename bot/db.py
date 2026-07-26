@@ -56,7 +56,24 @@ class OrderStatus(str, enum.Enum):
     exported = "exported"
     cancelled = "cancelled"
 
+class PromoCode(Base):
+    __tablename__ = "promo_codes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    bonus_amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_uses: Mapped[int | None] = mapped_column(Integer, nullable=True)   # если None – безлимитный
+    used_count: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_by: Mapped[int] = mapped_column(BigInteger, nullable=True)
 
+class PromoUsage(Base):
+    __tablename__ = "promo_usages"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    promo_code: Mapped[str] = mapped_column(String(32), ForeignKey("promo_codes.code"), index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    used_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

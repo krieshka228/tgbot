@@ -12,16 +12,26 @@ from bot.config import ADMIN_USER_ID
 from bot.keyboards import kb_admin_menu, kb_back_to_menu, kb_admin_confirm_payment, kb_admin_sync, kb_main_menu
 from bot.excel_reports import build_monthly_report, build_clients_excel
 from bot.utils import escape_markdown
+from sqlalchemy import select
+from bot.db import User, PromoCode
+from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from bot.utils import edit_or_send
 
+ADMIN_GROUP = 1
 logger = logging.getLogger(__name__)
 ITEMS_PER_PAGE = 5
 
 
 # ========== Вспомогательные функции ==========
 
+def escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 async def safe_edit(query, text, reply_markup=None, parse_mode=None):
     try:
-        await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        if parse_mode:
+            await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        else:
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
     except Exception as e:
         logger.warning(f"Не удалось отредактировать сообщение: {e}")
 
@@ -38,13 +48,67 @@ async def admin_bonus_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👤 Начислить бонусы пользователю", callback_data="admin:bonus_add_user")],
         [InlineKeyboardButton("👥 Начислить бонусы всем", callback_data="admin:bonus_add_all")],
         [InlineKeyboardButton("👀 Просмотр баланса пользователя", callback_data="admin:bonus_check")],
+        [InlineKeyboardButton("🎫 Промокоды", callback_data="admin:promo_menu")],
         [InlineKeyboardButton("⚙️ Админ-меню", callback_data="admin:menu")]
     ])
-    await safe_edit(query, "💎 **Управление бонусами**", reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    await safe_edit(query, "💎 <b>Управление бонусами</b>", reply_markup=kb, parse_mode=ParseMode.HTML)
 
-
+async def admin_promo_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+    async for session in get_session():
+        promos = (await session.execute(
+            select(PromoCode).order_by(PromoCode.created_at.desc())
+        )).scalars().all()
+    if not promos:
+        await safe_edit(query, "🎫 Нет созданных промокодов.", reply_markup=kb_back_to_menu())
+        return
+    lines = ["🎫 <b>Промокоды:</b>"]
+    now = datetime.now(timezone.utc)
+    for p in promos:
+        active = "✅" if p.is_active else "❌"
+        uses = f"{p.used_count}/{p.max_uses}" if p.max_uses else f"{p.used_count}/∞"
+        expires_info = ""
+        if p.expires_at:
+            # Приводим к UTC, если дата наивная
+            expires_dt = p.expires_at.replace(tzinfo=timezone.utc) if p.expires_at.tzinfo is None else p.expires_at
+            if expires_dt < now:
+                expires_info = f" (истёк {expires_dt.strftime('%d.%m.%Y')})"
+            else:
+                expires_info = f" (до {expires_dt.strftime('%d.%m.%Y %H:%M')})"
+        lines.append(
+            f"{active} <code>{escape_html(p.code)}</code> — {p.bonus_amount} бонусов, {uses}{expires_info}"
+        )
+    await safe_edit(query, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=kb_back_to_menu())
+async def admin_promo_delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+    context.user_data['state'] = 'admin_promo_delete'
+    await safe_edit(query,
+        "✏️ Введите код промокода, который нужно удалить:",
+        reply_markup=kb_back_to_menu()
+    )
+async def admin_promo_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Создать промокод", callback_data="admin:promo_create")],
+        [InlineKeyboardButton("📋 Список промокодов", callback_data="admin:promo_list")],
+        [InlineKeyboardButton("🗑 Удалить промокод", callback_data="admin:promo_delete")],
+        [InlineKeyboardButton("↩️ Назад", callback_data="admin:bonus_menu")]
+    ])
+    await safe_edit(query, "🎫 <b>Управление промокодами</b>", reply_markup=kb, parse_mode=ParseMode.HTML)
 async def admin_bonus_add_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запуск ввода user_id для начисления бонусов."""
+    """Запуск ввода username для начисления бонусов."""
     query = update.callback_query
     await query.answer()
     if query.from_user.id != ADMIN_USER_ID:
@@ -52,10 +116,11 @@ async def admin_bonus_add_user_start(update: Update, context: ContextTypes.DEFAU
         return
 
     context.user_data['state'] = 'admin_bonus_add_user'
-    await safe_edit(query, "✏️ Введите user_id пользователя и сумму бонусов через пробел.\n\nПример: `123456 500`",
-                    reply_markup=kb_back_to_menu(), parse_mode=ParseMode.MARKDOWN)
-
-
+    await safe_edit(query,
+        "✏️ Введите @username пользователя и сумму бонусов через пробел.\n\n"
+        "Пример: @username 500",
+        reply_markup=kb_back_to_menu()
+    )
 async def admin_bonus_add_all_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Запуск массового начисления бонусов всем пользователям."""
     query = update.callback_query
@@ -65,12 +130,53 @@ async def admin_bonus_add_all_start(update: Update, context: ContextTypes.DEFAUL
         return
 
     context.user_data['state'] = 'admin_bonus_add_all'
-    await safe_edit(query, "✏️ Введите сумму бонусов для начисления ВСЕМ пользователям.\n\nПример: `500`",
-                    reply_markup=kb_back_to_menu(), parse_mode=ParseMode.MARKDOWN)
+    await safe_edit(query,
+        "✏️ Введите сумму бонусов для начисления ВСЕМ пользователям.\n\nПример: 500",
+        reply_markup=kb_back_to_menu()
+    )
 
+async def admin_bonus_check_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка баланса пользователя по @username."""
+    message = update.message
+    if message.from_user.id != ADMIN_USER_ID:
+        return
+    if context.user_data.get('state') != 'admin_bonus_check':
+        return
 
+    raw_username = message.text.strip()
+    username = raw_username.lstrip('@')
+
+    if not username:
+        await edit_or_send(context, message.chat_id,
+                           "❌ Введите корректный @username.",
+                           reply_markup=kb_back_to_menu())
+        context.user_data.pop('state', None)
+        return
+
+    async for session in get_session():
+        stmt = select(User).where(User.username == username)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+
+        if not user:
+            await edit_or_send(context, message.chat_id,
+                               f"❌ Пользователь @{username} не найден.",
+                               reply_markup=kb_back_to_menu())
+            context.user_data.pop('state', None)
+            return
+
+        bonus = user.bonus_balance or 0
+        name = user.full_name or f"@{user.username}" or f"ID {user.id}"
+        text = f"💎 Баланс пользователя <b>{escape_html(name)}</b>: <b>{bonus} бонусов</b>"
+
+        # Показываем результат в новом сообщении (сбрасываем main_msg_id)
+        context.user_data.pop('main_msg_id', None)
+        await edit_or_send(context, message.chat_id, text,
+                           reply_markup=kb_admin_menu(), parse_mode=ParseMode.HTML)
+
+    context.user_data.pop('state', None)
 async def admin_bonus_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запуск проверки баланса пользователя."""
+    """Запуск проверки баланса пользователя по @username."""
     query = update.callback_query
     await query.answer()
     if query.from_user.id != ADMIN_USER_ID:
@@ -78,9 +184,11 @@ async def admin_bonus_check_start(update: Update, context: ContextTypes.DEFAULT_
         return
 
     context.user_data['state'] = 'admin_bonus_check'
-    await safe_edit(query, "✏️ Введите user_id пользователя для проверки баланса.\n\nПример: `123456`",
-                    reply_markup=kb_back_to_menu(), parse_mode=ParseMode.MARKDOWN)
-
+    await safe_edit(
+        query,
+        "✏️ Введите @username пользователя для проверки баланса.\n\nПример: @durov",
+        reply_markup=kb_back_to_menu()
+    )
 async def show_stock_categories(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     query = update.callback_query
     async for session in get_session():
@@ -275,13 +383,11 @@ async def back_to_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # Вход в админ-меню сбрасывает любой незавершённый текстовый ввод (FSM).
     context.user_data.pop('state', None)
     if query.from_user.id != ADMIN_USER_ID:
         await query.answer("Нет доступа.", show_alert=True)
         return
-    await safe_edit(query, "⚙️ **Админ‑меню:**", reply_markup=kb_admin_menu(), parse_mode=ParseMode.MARKDOWN)
-
+    await safe_edit(query, "⚙️ <b>Админ‑меню:</b>", reply_markup=kb_admin_menu(), parse_mode=ParseMode.HTML)
 
 async def excel_monthly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -758,7 +864,22 @@ async def product_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await show_manage_products_page(query, context, page=page)
 
-
+async def admin_promo_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+    context.user_data['state'] = 'admin_promo_create'
+    await safe_edit(query,
+        "✏️ Введите данные промокода в формате:\n"
+        "<code>КОД</code> <бонусы> [лимит] [дата_окончания]\n\n"
+        "Примеры:\n"
+        "<code>NEWYEAR 500 100 31-12-2026</code> — 500 бонусов, 100 активаций, до 31.12.2026\n"
+        "<code>WELCOME 200</code> — безлимитный и бессрочный\n"
+        "<code>SUMMER 300 31-08-2026</code> — 300 бонусов, без лимита, до 31.08.2026",
+        reply_markup=kb_back_to_menu()
+    )
 async def product_hide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -948,3 +1069,16 @@ def register(app):
     app.add_handler(CallbackQueryHandler(admin_bonus_add_user_start, pattern='^admin:bonus_add_user$'))
     app.add_handler(CallbackQueryHandler(admin_bonus_add_all_start, pattern='^admin:bonus_add_all$'))
     app.add_handler(CallbackQueryHandler(admin_bonus_check_start, pattern='^admin:bonus_check$'))
+
+    app.add_handler(CallbackQueryHandler(admin_bonus_check_start, pattern='^admin:bonus_check$'))
+
+    # Текстовый обработчик для проверки баланса (только когда состояние = admin_bonus_check)
+    #app.add_handler(MessageHandler(
+    #    filters.TEXT & filters.User(ADMIN_USER_ID),
+    #    admin_bonus_check_do
+    #), group=ADMIN_GROUP)
+
+    app.add_handler(CallbackQueryHandler(admin_promo_menu, pattern='^admin:promo_menu$'))
+    app.add_handler(CallbackQueryHandler(admin_promo_create_start, pattern='^admin:promo_create$'))
+    app.add_handler(CallbackQueryHandler(admin_promo_list, pattern='^admin:promo_list$'))
+    app.add_handler(CallbackQueryHandler(admin_promo_delete_start, pattern='^admin:promo_delete$'))

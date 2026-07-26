@@ -13,6 +13,7 @@ from aiomax import Bot as MaxBot
 import aiohttp
 
 from bot.config import settings
+from telegram.ext import ContextTypes
 
 # Удаляем системные прокси-переменные, чтобы aiohttp не использовал их для Max API
 for var in ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']:
@@ -22,7 +23,19 @@ os.environ.setdefault('NO_PROXY', 'platform-api.max.ru,api.max.ru')
 logger = logging.getLogger(__name__)
 MAX_API_BASE = "https://platform-api.max.ru"
 
+from datetime import datetime
 
+def parse_datetime(text: str) -> datetime | None:
+    """Пытается разобрать дату/время. Форматы: ДД-ММ-ГГГГ [ЧЧ:ММ] или ГГГГ-ММ-ДД (для совместимости)."""
+    for fmt in ("%d-%m-%Y %H:%M", "%d-%m-%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+def escape_html(text: str) -> str:
+    """Экранирует специальные символы HTML."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 def parse_quantity(text: str) -> Optional[int]:
     """Извлекает целое количество из текста (например, '3 шт', '5')."""
     if not text:
@@ -149,16 +162,55 @@ def parse_post_product(text: str) -> tuple:
 
 
 def format_cart(order) -> str:
-    """Форматирует корзину для отображения."""
+    """Форматирует корзину для отображения с артикулами."""
     if not order.items:
         return "🛒 Корзина пуста."
     lines = [f"🛒 **Заказ #{order.id}**\n"]
     for item in order.items:
-        name = escape_markdown(item.product.name) if item.product else f"Товар #{item.product_id}"
-        lines.append(f"• {name}: {item.quantity} шт. × {item.price_at_order:.0f} ₽")
+        product = item.product
+        if product:
+            name = escape_markdown(product.name)
+            article = product.article or "—"
+            lines.append(f"• {name} (арт. {article}): {item.quantity} шт. × {item.price_at_order:.0f} ₽")
+        else:
+            lines.append(f"• Товар #{item.product_id}: {item.quantity} шт. × {item.price_at_order:.0f} ₽")
     lines.append(f"\n💰 **Итого: {order.total_amount:.0f} ₽**")
     return "\n".join(lines)
 
+async def edit_or_send(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    reply_markup=None,
+    parse_mode=None,
+    *,
+    force_new: bool = False,
+) -> int:
+    """Редактирует сохранённое сообщение бота или отправляет новое.
+    Возвращает message_id актуального сообщения.
+    """
+    msg_id = context.user_data.get('main_msg_id')
+    if not force_new and msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
+            return msg_id
+        except Exception:
+            pass
+    # Отправляем новое
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode,
+    )
+    context.user_data['main_msg_id'] = sent.message_id
+    return sent.message_id
 
 def format_order_for_admin(order) -> str:
     """Форматирует информацию о заказе для администратора с товарами и артикулами."""

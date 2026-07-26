@@ -20,6 +20,7 @@ from bot.db import (
     Order,
     OrderItem,
     Product,
+    User,  # <-- ДОБАВИТЬ
     get_bot_setting,
     invalidate_catalog_cache,
 )

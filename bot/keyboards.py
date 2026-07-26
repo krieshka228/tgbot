@@ -24,6 +24,7 @@ def kb_main_menu(is_admin: bool = False):
         [InlineKeyboardButton("🔎 Поиск по артикулу", callback_data="search:article")],
         [InlineKeyboardButton("🛒 Моя корзина", callback_data="cart:view")],
         [InlineKeyboardButton("📋 Мои заказы", callback_data="orders:list")],
+        [InlineKeyboardButton("💎 Бонусы", callback_data="bonus:menu")],
         [InlineKeyboardButton("✉️ Написать администратору", callback_data="contact:admin")],
     ]
     if is_admin:

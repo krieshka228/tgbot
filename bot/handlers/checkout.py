@@ -5,7 +5,7 @@ from telegram.constants import ParseMode
 from bot.db import get_session, get_order_with_items, OrderStatus, invalidate_catalog_cache
 from bot.keyboards import kb_payment, kb_admin_confirm_payment, kb_main_menu, kb_back_to_menu
 from bot.config import ADMIN_USER_ID, ADMIN_CHAT_ID
-from bot.utils import format_order_for_admin, format_cart, escape_markdown  # <-- только один импорт
+from bot.utils import format_order_for_admin, format_cart  # убрали escape_markdown
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,6 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-
         order.status = OrderStatus.cancelled
         await session.commit()
         invalidate_catalog_cache()
@@ -68,13 +67,12 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Не удалось уведомить администратора об отмене: {e}")
 
         order_info = format_order_for_admin(order)
-        order_info_escaped = escape_markdown(order_info)
-        text = f"❌ **Заказ #{order_id} отменён.**\n\n{order_info_escaped}"
+        text = f"❌ **Заказ #{order_id} отменён.**\n\n{order_info}"
         try:
             await query.edit_message_text(
                 text,
-                reply_markup=kb_back_to_menu(),
-                parse_mode=ParseMode.MARKDOWN
+                reply_markup=kb_back_to_menu()
+                # parse_mode убран
             )
         except Exception:
             try:
@@ -84,8 +82,7 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
                 text=text,
-                reply_markup=kb_back_to_menu(),
-                parse_mode=ParseMode.MARKDOWN
+                reply_markup=kb_back_to_menu()
             )
 
 
@@ -118,16 +115,13 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order.receipt_file_id = file_id
         await session.commit()
         order_info = format_order_for_admin(order)
-        order_info_escaped = escape_markdown(order_info)
 
-    # Исправлен синтаксис caption
-    caption = f"💳 **Новый чек об оплате!**\n\n{order_info_escaped}\n\nПроверьте оплату:"
+    caption = f"💳 **Новый чек об оплате!**\n\n{order_info}\n\nПроверьте оплату:"
     try:
         await context.bot.send_photo(
             chat_id=ADMIN_CHAT_ID,
             photo=file_id,
             caption=caption,
-            parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb_admin_confirm_payment(order_id)
         )
     except Exception as e:
