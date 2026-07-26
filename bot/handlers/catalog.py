@@ -55,7 +55,7 @@ from bot.keyboards import kb_back_to_menu
 logger = logging.getLogger(__name__)
 
 # Товары — медиа-карточками, поэтому страница небольшая (флуд-лимиты Telegram).
-PRODUCTS_PER_PAGE = 100
+PRODUCTS_PER_PAGE = 20
 # Категории/подкатегории — кнопки в столбик.
 LIST_PER_PAGE = 8
 
@@ -314,6 +314,8 @@ def _product_caption(product: Product) -> str:
     return "\n".join(lines)
 
 
+from telegram.error import RetryAfter
+
 async def _send_product_card(bot, chat_id: int, product: Product) -> list[int]:
     caption = _product_caption(product)
     keyboard = InlineKeyboardMarkup(
@@ -329,39 +331,47 @@ async def _send_product_card(bot, chat_id: int, product: Product) -> list[int]:
     for video_id in videos:
         media.append(InputMediaVideo(media=video_id))
 
-    # Случай 1: нет медиа
     if not media:
         m = await bot.send_message(chat_id, text=caption, reply_markup=keyboard, parse_mode=ParseMode.HTML)
         return [m.message_id]
 
-    # Случай 2: ровно один файл
-    if len(media) == 1:
-        if photos:
-            m = await bot.send_photo(chat_id, photo=photos[0], caption=caption,
-                                     reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    async def send_with_retry(coro, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                return await coro
+            except RetryAfter as e:
+                wait = e.retry_after + 1
+                logger.warning(f"Flood control, waiting {wait}s before retry {attempt+1}")
+                await asyncio.sleep(wait)
+        raise
+
+    try:
+        if len(media) == 1:
+            if photos:
+                m = await send_with_retry(bot.send_photo(chat_id, photo=photos[0], caption=caption,
+                                                        reply_markup=keyboard, parse_mode=ParseMode.HTML))
+            else:
+                m = await send_with_retry(bot.send_video(chat_id, video=videos[0], caption=caption,
+                                                        reply_markup=keyboard, parse_mode=ParseMode.HTML))
+            return [m.message_id]
+
+        first = media[0]
+        if isinstance(first, InputMediaPhoto):
+            media[0] = InputMediaPhoto(media=first.media, caption=caption, parse_mode=ParseMode.HTML)
         else:
-            m = await bot.send_video(chat_id, video=videos[0], caption=caption,
-                                     reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            media[0] = InputMediaVideo(media=first.media, caption=caption, parse_mode=ParseMode.HTML)
+
+        messages = await send_with_retry(bot.send_media_group(chat_id, media=media))
+        message_ids = [msg.message_id for msg in messages]
+
+        btn_msg = await send_with_retry(bot.send_message(chat_id, text="Выберите действие:", reply_markup=keyboard))
+        message_ids.append(btn_msg.message_id)
+        return message_ids
+
+    except Exception as e:
+        logger.warning(f"Ошибка отправки медиа для товара {product.id}, показываем без медиа: {e}")
+        m = await bot.send_message(chat_id, text=caption, reply_markup=keyboard, parse_mode=ParseMode.HTML)
         return [m.message_id]
-
-    # Случай 3: несколько файлов – альбом + отдельное сообщение с кнопкой
-    first = media[0]
-    if isinstance(first, InputMediaPhoto):
-        media[0] = InputMediaPhoto(media=first.media, caption=caption, parse_mode=ParseMode.HTML)
-    else:
-        media[0] = InputMediaVideo(media=first.media, caption=caption, parse_mode=ParseMode.HTML)
-
-    messages = await bot.send_media_group(chat_id, media=media)
-    message_ids = [msg.message_id for msg in messages]
-
-    btn_msg = await bot.send_message(
-        chat_id,
-        text="Выберите действие:",
-        reply_markup=keyboard,
-    )
-    message_ids.append(btn_msg.message_id)
-
-    return message_ids
 
 @catalog_handler
 async def show_products_page(query, context, page: int = 0):
