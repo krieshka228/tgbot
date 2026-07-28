@@ -158,7 +158,7 @@ def parse_post_product(text: str) -> tuple:
         description_lines.append(line)
     description = "\n".join(description_lines) if description_lines else None
 
-    return (name, article, price, category, description)
+    return (name, article, price, category, description, stock)
 
 
 def format_cart(order) -> str:

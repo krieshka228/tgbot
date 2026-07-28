@@ -117,6 +117,8 @@ async def process_order_qty(message, text, context):
         await message.reply_text("❌ Введите целое положительное число.", reply_markup=kb_back_to_menu())
         return True
 
+    # Сохраним имя и цену до выхода из сессии
+    product_name = None
     async for session in get_session():
         user = await get_or_create_user(session, user_id,
                                         full_name=message.from_user.full_name,
@@ -126,6 +128,7 @@ async def process_order_qty(message, text, context):
             await message.reply_text("❌ Товар недоступен.", reply_markup=kb_back_to_menu())
             context.user_data.pop('state', None)
             return True
+        product_name = product.name   # <-- сохраняем внутри сессии
 
         from bot.db import get_or_create_draft, add_item_to_order
         order = await get_or_create_draft(session, user_id)
@@ -133,14 +136,12 @@ async def process_order_qty(message, text, context):
             selectinload(Order.items).selectinload(OrderItem.product))
         order = (await session.execute(stmt)).scalar_one()
         await add_item_to_order(session, order, product, qty)
-        # Обновляем order
         order = (await session.execute(stmt)).scalar_one()
 
-    # --- НОВОЕ СООБЩЕНИЕ С ПОДТВЕРЖДЕНИЕМ ---
-    safe_name = escape_markdown(product.name)
+    # Теперь product уже недоступен, но имя у нас есть
+    safe_name = escape_markdown(product_name) if product_name else "Товар"
     confirm_text = f"✅ **{safe_name}** × {qty} шт. добавлен в корзину!"
 
-    # ✅ Получаем контекст каталога для кнопки "Продолжить покупки"
     cat = context.user_data.get('catalog_category', '')
     sub = context.user_data.get('catalog_subcategory', '')
     page = context.user_data.get('catalog_page', 0)
@@ -156,7 +157,6 @@ async def process_order_qty(message, text, context):
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]
     ])
 
-    # Если карточка товара была отправлена – редактируем её
     if card_msg_id:
         try:
             await context.bot.edit_message_text(
@@ -167,7 +167,6 @@ async def process_order_qty(message, text, context):
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception:
-            # Если редактирование не удалось, отправляем новое сообщение
             await message.reply_text(confirm_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
     else:
         await message.reply_text(confirm_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
