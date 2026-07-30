@@ -873,11 +873,10 @@ async def admin_promo_create_start(update: Update, context: ContextTypes.DEFAULT
     context.user_data['state'] = 'admin_promo_create'
     await safe_edit(query,
         "✏️ Введите данные промокода в формате:\n"
-        "<code>КОД</code> <бонусы> [лимит] [дата_окончания]\n\n"
+        "КОД <бонусы> [лимит] [дата_окончания]\n\n"
         "Примеры:\n"
-        "<code>NEWYEAR 500 100 31-12-2026</code> — 500 бонусов, 100 активаций, до 31.12.2026\n"
-        "<code>WELCOME 200</code> — безлимитный и бессрочный\n"
-        "<code>SUMMER 300 31-08-2026</code> — 300 бонусов, без лимита, до 31.08.2026",
+        "NEWYEAR 500 100 31-12-2026 — 500 бонусов, 100 активаций, до 31.12.2026\n"
+        "WELCOME 200 — безлимитный и бессрочный",
         reply_markup=kb_back_to_menu()
     )
 async def product_hide(update: Update, context: ContextTypes.DEFAULT_TYPE):
