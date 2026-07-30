@@ -185,6 +185,13 @@ def _ensure_added_columns(conn):
         cols = {c["name"] for c in insp.get_columns("users")}
         if "platform" not in cols:
             conn.execute(text("ALTER TABLE users ADD COLUMN platform TEXT"))
+        # новые поля для бонусной системы
+        if "bonus_balance" not in cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN bonus_balance INTEGER DEFAULT 0"))
+    if "orders" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("orders")}
+        if "bonus_used" not in cols:
+            conn.execute(text("ALTER TABLE orders ADD COLUMN bonus_used INTEGER DEFAULT 0"))
 
 
 async def init_db() -> None:

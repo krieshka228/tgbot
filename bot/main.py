@@ -33,22 +33,13 @@ from bot.error_handler import error_handler
 from bot.reminders import send_reminders
 from bot.utils import logger
 
-# Для загрузки фото в Max
-#from aiomax import Bot as MaxBot
-
 logger = logging.getLogger(__name__)
 
 
 async def post_init(app: Application) -> None:
-    """Инициализация БД и MaxBot при старте."""
+    """Инициализация БД при старте."""
     await init_db()
     logger.info("database initialized", extra={"event": "startup"})
-
-    # Инициализируем сессию MaxBot
-    max_bot = app.bot_data.get("max_bot")
-    if max_bot:
-        await max_bot.start()
-        logger.info("MaxBot session started")
 
     # Проверка доступа к каналу
     try:
@@ -63,12 +54,9 @@ async def post_init(app: Application) -> None:
             extra={"event": "channel_check", "error": repr(exc)},
         )
 
+
 async def post_shutdown(app: Application) -> None:
-    """Graceful shutdown: закрываем сессию MaxBot и пул БД."""
-    max_bot = app.bot_data.get("max_bot")
-    if max_bot:
-        await max_bot.close()
-        logger.info("MaxBot session closed")
+    """Graceful shutdown: закрываем пул БД."""
     await dispose_engine()
     logger.info("database engine disposed", extra={"event": "shutdown"})
 
@@ -114,11 +102,6 @@ def build_application() -> Application:
         _daily_reminder,
         time=time(hour=6, minute=0, tzinfo=pytz.timezone("Europe/Moscow")),
     )
-
-    # 5) Создаём MaxBot для загрузки медиа и сохраняем в bot_data
-    #max_bot = MaxBot(settings.max_bot_token)
-    #app.bot_data["max_bot"] = max_bot
-    #logger.info("MaxBot instance created for media uploads")
 
     return app
 

@@ -317,7 +317,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if not post_id:
-        await message.reply_text("❌ Не удалось определить пост.")
+        logger.warning("no post_id resolved for comment")
         return
 
     async for session in get_session():
@@ -345,7 +345,6 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         extra={"article": article, "product_id": product.id})
 
         if not product:
-            await message.reply_text("❌ Товар не найден. Возможно, пост был добавлен до синхронизации.")
             logger.warning("no product for post_id", extra={"post_id": post_id})
             return
 
@@ -356,36 +355,31 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 4. Если нет количества — просто комментарий
         if qty is None:
-            await message.reply_text("💬 Спасибо за комментарий! Чтобы заказать, напишите количество.")
+            # Не пишем в группу, только логируем
             return
 
         # 5. Проверка активности товара
         if not product.is_active:
-            await message.reply_text("❌ Этот товар временно недоступен.")
+            logger.info("inactive product requested", extra={"product_id": product.id})
             return
 
         # 6. Проверка наличия QR-кода (Telegram file_id)
         qr_telegram = await get_bot_setting(session, "payment_qr_telegram")
         if not qr_telegram:
-            await message.reply_text("⚠️ Оплата временно недоступна. Попробуйте позже.")
+            logger.warning("payment QR not set, cannot process order")
             return
 
-        # 8. Добавление в корзину и отправка/обновление подтверждения
+        # 7. Добавление в корзину и отправка/обновление подтверждения
         try:
-            # Получаем или создаём корзину (draft order)
             order = await get_or_create_draft(session, user_id)
-            # Загружаем позиции заказа
             stmt_order = select(Order).where(Order.id == order.id).options(
                 selectinload(Order.items).selectinload(OrderItem.product)
             )
             order = (await session.execute(stmt_order)).scalar_one()
 
-            # Добавляем товар в корзину
             await add_item_to_order(session, order, product, qty)
-            # Обновляем order для актуальных данных
             order = (await session.execute(stmt_order)).scalar_one()
 
-            # Формируем текст с корзиной
             cart_text = format_cart(order)
             text_msg = (
                 f"🛒 **Ваша корзина:**\n\n"
@@ -411,7 +405,6 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=kb,
                         parse_mode="Markdown"
                     )
-                    # Обновляем запись (product_id и quantity не используются, но можно обновить)
                     existing_pending.product_id = product.id
                     existing_pending.quantity = qty
                     await session.commit()
@@ -428,7 +421,6 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await session.delete(existing_pending)
                     await session.commit()
 
-            # Отправляем новое сообщение
             sent = await context.bot.send_message(
                 chat_id=user_id,
                 text=text_msg,
@@ -436,7 +428,6 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
 
-            # Создаём запись PendingOrder с ID сообщения
             pending = PendingOrder(
                 user_id=user_id,
                 product_id=product.id,
@@ -463,9 +454,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pending = PendingOrder(user_id=user_id, product_id=product.id, quantity=qty)
                 session.add(pending)
             await session.commit()
-            await message.reply_text(
-                f"✅ Товар добавлен в корзину. Напишите /start, чтобы подтвердить заказ."
-            )
+            # Не пишем в группу, только логируем
             await message.delete()
             return
 

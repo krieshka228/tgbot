@@ -86,6 +86,7 @@ async def _process_delayed_media_group(context: ContextTypes.DEFAULT_TYPE, group
     fake_msg.message_id = msg_ids[0] if msg_ids else 0
 
     if caption.strip():
+        # Передаём видео, но внутри process_admin_sync они не будут загружены (закомментировано)
         await process_admin_sync(fake_msg, caption, context, photos=photos, videos=videos)
         # Удаляем исходные сообщения альбома после успешного создания товара
         for mid in msg_ids:
@@ -104,7 +105,6 @@ async def _process_delayed_media_group(context: ContextTypes.DEFAULT_TYPE, group
             text="📝 Отправьте текст поста (название, артикул, цену…) для этого альбома.",
             reply_markup=kb_back_to_menu()
         )
-
 
 async def process_order_qty(message, text, context):
     qty = parse_quantity(text)
@@ -643,7 +643,7 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
             )
         return True
 
-    name, article, price, category, description = parse_post_product(text)
+    name, article, price, category, description, _stock = parse_post_product(text)
     logger.info(f"🔵 Парсинг: name={name}, article={article}, price={price}, category={category}")
 
     if not name or not article:
@@ -698,15 +698,17 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
         max_photo_ids = ",".join(tokens) if tokens else None
         logger.info(f"🔵 Загружено фото в Max: {max_photo_ids}")
 
+    # --- Загрузка видео временно отключена ---
+    # max_video_ids = None
+    # if videos:
+    #     tokens = []
+    #     for file_id in videos:
+    #         token = await upload_video_to_max(file_id, context.bot)
+    #         if token:
+    #             tokens.append(token)
+    #     max_video_ids = ",".join(tokens) if tokens else None
+    #     logger.info(f"🔵 Загружено видео в Max: {max_video_ids}")
     max_video_ids = None
-    if videos:
-        tokens = []
-        for file_id in videos:
-            token = await upload_video_to_max(file_id, context.bot)
-            if token:
-                tokens.append(token)
-        max_video_ids = ",".join(tokens) if tokens else None
-        logger.info(f"🔵 Загружено видео в Max: {max_video_ids}")
 
     # Сохраняем товар
     async for session in get_session():

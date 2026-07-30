@@ -309,28 +309,30 @@ async def _upload_file_to_max(file_like: io.BytesIO, file_type: str) -> str | No
 
 async def upload_photo_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
     """Загружает фото из Telegram в Max, возвращает Max-токен."""
- #   try:
-  #      file_obj = await tg_bot.get_file(file_id)
-   #     file_like = io.BytesIO()
-    #    await file_obj.download_to_memory(file_like)
-     #   file_like.seek(0)
-      #  return await _upload_file_to_max(file_like, "image")
-    #except Exception as e:
-     #   logger.warning(f"Не удалось загрузить фото {file_id} в Max: {e}")
+    try:
+        file_obj = await tg_bot.get_file(file_id)
+        file_like = io.BytesIO()
+        await file_obj.download_to_memory(file_like)
+        file_like.seek(0)
+        return await _upload_file_to_max(file_like, "image")
+    except Exception as e:
+        logger.warning(f"Не удалось загрузить фото {file_id} в Max: {e}")
     return None
 
 
 async def upload_video_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
-    """Загружает видео из Telegram в Max через aiomax, возвращает валидный токен."""
+    """Загружает видео из Telegram в Max, возвращает валидный токен."""
     try:
         file_obj = await tg_bot.get_file(file_id)
-        file_path = f"/tmp/{file_id}.mp4"
+        # Используем временный файл с уникальным именем
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+            file_path = tmp.name
         await file_obj.download_to_drive(file_path)
 
         from aiomax import Bot as MaxBot
         max_bot = MaxBot(settings.max_bot_token)
 
-        # Создаём сессию с коннектором без прокси
         connector = aiohttp.TCPConnector(ssl=True)
         max_bot.session = aiohttp.ClientSession(connector=connector)
         max_bot.session.headers.update({'Authorization': settings.max_bot_token})
@@ -340,9 +342,14 @@ async def upload_video_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
         logger.info(f"Видео загружено через aiomax, токен: {token}")
 
         await max_bot.session.close()
+        # Удаляем временный файл
+        os.unlink(file_path)
         return token
     except Exception as e:
-        logger.warning(f"Не удалось загрузить видео {file_id} в Max: {e}")
+        logger.error(f"Ошибка загрузки видео {file_id} в Max: {e}", exc_info=True)
+        # Если была создана сессия, попробуем закрыть
+        if 'max_bot' in locals() and max_bot.session:
+            await max_bot.session.close()
         return None
 
 
