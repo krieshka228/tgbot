@@ -61,12 +61,13 @@ class PromoCode(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     bonus_amount: Mapped[int] = mapped_column(Integer, nullable=False)
-    max_uses: Mapped[int | None] = mapped_column(Integer, nullable=True)   # если None – безлимитный
+    max_uses: Mapped[int | None] = mapped_column(Integer, nullable=True)
     used_count: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     created_by: Mapped[int] = mapped_column(BigInteger, nullable=True)
+    platform: Mapped[str | None] = mapped_column(String(16), nullable=True)  # ← новое: 'TG', 'MAX', None
 
 class PromoUsage(Base):
     __tablename__ = "promo_usages"
@@ -81,7 +82,9 @@ class User(Base):
     full_name: Mapped[str | None] = mapped_column(String(256))
     phone: Mapped[str | None] = mapped_column(String(32))
     address: Mapped[str | None] = mapped_column(Text)
-    bonus_balance: Mapped[int] = mapped_column(Integer, default=0)
+    bonus_balance: Mapped[int] = mapped_column(Integer, default=0)  # оставляем для совместимости
+    bonus_balance_tg: Mapped[int] = mapped_column(Integer, default=0)
+    bonus_balance_max: Mapped[int] = mapped_column(Integer, default=0)
     platform: Mapped[str | None] = mapped_column(String(32), nullable=True)  # "MAX" или "Telegram"
     consented: Mapped[bool] = mapped_column(Boolean, default=False)
     consented_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -185,19 +188,35 @@ def _ensure_added_columns(conn):
         cols = {c["name"] for c in insp.get_columns("users")}
         if "platform" not in cols:
             conn.execute(text("ALTER TABLE users ADD COLUMN platform TEXT"))
-        # новые поля для бонусной системы
         if "bonus_balance" not in cols:
             conn.execute(text("ALTER TABLE users ADD COLUMN bonus_balance INTEGER DEFAULT 0"))
+        if "bonus_balance_tg" not in cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN bonus_balance_tg INTEGER DEFAULT 0"))
+        if "bonus_balance_max" not in cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN bonus_balance_max INTEGER DEFAULT 0"))
     if "orders" in insp.get_table_names():
         cols = {c["name"] for c in insp.get_columns("orders")}
         if "bonus_used" not in cols:
             conn.execute(text("ALTER TABLE orders ADD COLUMN bonus_used INTEGER DEFAULT 0"))
+    if "promo_codes" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("promo_codes")}
+        if "platform" not in cols:
+            conn.execute(text("ALTER TABLE promo_codes ADD COLUMN platform VARCHAR(16)"))
 
 
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_added_columns)
+
+        # ★ Вставьте сюда ★
+        await conn.execute(text(
+            "UPDATE users SET bonus_balance_tg = bonus_balance WHERE bonus_balance_tg = 0 AND bonus_balance > 0"
+        ))
+        await conn.execute(text(
+            "UPDATE users SET bonus_balance_max = bonus_balance WHERE bonus_balance_max = 0 AND bonus_balance > 0 AND platform = 'MAX'"
+        ))
+
         for stmt in _CATALOG_INDEXES:
             await conn.execute(text(stmt))
 
@@ -335,7 +354,6 @@ async def mark_product_published(session: AsyncSession, product: Product, post_i
 
 
 # ---- UPSERT ----
-
 async def upsert_product(
     session: AsyncSession,
     post_id: str,
@@ -378,6 +396,7 @@ async def upsert_product(
             is_active=is_active,
         )
         session.add(product)
+        logger.info(f"🔵 НОВЫЙ товар ДО коммита: max_photo_ids={product.max_photo_ids}")
     else:
         product.name = name
         product.price = price

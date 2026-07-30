@@ -177,7 +177,7 @@ async def process_order_qty(message, text, context):
 from datetime import datetime, timezone
 
 async def process_admin_promo_create(message, text, context):
-    """Создание промокода админом."""
+    """Создание промокода админом (TG-бот)."""
     if message.from_user.id != ADMIN_USER_ID:
         return True
 
@@ -201,20 +201,16 @@ async def process_admin_promo_create(message, text, context):
     max_uses = None
     expires_at = None
 
-    # Разбираем третий и четвёртый параметры (могут быть в любом порядке: лимит, дата)
     remaining = parts[2:]
     for part in remaining:
-        # пробуем как число лимита
         limit = parse_positive_int(part)
         if limit is not None:
             max_uses = limit
             continue
-        # пробуем как дату
         dt = parse_datetime(part)
         if dt is not None:
             expires_at = dt
             continue
-        # если не подошло – ошибка
         await edit_or_send(context, message.chat_id,
                            f"❌ Не удалось распознать параметр '{part}'. Ожидается число или дата ДД-ММ-ГГГГ.",
                            reply_markup=kb_admin_menu())
@@ -235,12 +231,12 @@ async def process_admin_promo_create(message, text, context):
             bonus_amount=bonus,
             max_uses=max_uses,
             expires_at=expires_at,
-            created_by=message.from_user.id
+            created_by=message.from_user.id,
+            platform='TG'   # ← новая привязка к платформе
         )
         session.add(promo)
         await session.commit()
 
-    # Формируем сообщение о результате
     limits = []
     if max_uses:
         limits.append(f"лимит {max_uses} активаций")
@@ -263,7 +259,7 @@ async def bonus_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async for session in get_session():
         user = await session.get(User, user_id)
-        bonus = user.bonus_balance if user else 0
+        bonus = user.bonus_balance_tg if user else 0
 
     text = f"💎 **Ваши бонусы**\n\n💰 Баланс: {bonus} бонусов.\nВы можете оплатить до 20% стоимости заказа бонусами."
     kb = InlineKeyboardMarkup([
@@ -722,6 +718,8 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
             description=description,
         )
         logger.info(f"🔵 Товар сохранён: id={product.id}, name={product.name}")
+        logger.info(
+            f"🔵 ПОСЛЕ upsert_product: max_photo_ids={product.max_photo_ids}, photo_file_ids={product.photo_file_ids}")
 
     # Удаляем сообщение
     try:
@@ -751,6 +749,7 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
 
     context.user_data['sync_count'] = context.user_data.get('sync_count', 0) + 1
     logger.info(f"🔵 process_admin_sync FINISHED for {name}")
+    logger.info(f"🔵 ПЕРЕД upsert_product: max_photo_ids={max_photo_ids}, photo_file_ids={photo_file_ids}")
     return True
 async def process_admin_set_stock(message, text, context):
     if message.from_user.id != ADMIN_USER_ID:
@@ -1243,22 +1242,19 @@ async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
 
 async def process_admin_bonus_add_user(message, text, context):
-    """Начисление бонусов пользователю по @username."""
+    """Начисление бонусов пользователю по @username или user_id."""
     if message.from_user.id != ADMIN_USER_ID:
         return True
 
     parts = text.strip().split()
     if len(parts) != 2:
         await edit_or_send(context, message.chat_id,
-                           "❌ Формат: @username <сумма>. Пример: @durov 500",
+                           "❌ Формат: @username <сумма> или user_id <сумма>.\nПример: @durov 500 или 123456 500",
                            reply_markup=kb_admin_menu())
         context.user_data.pop('state', None)
         return True
 
-    raw_username = parts[0]
-    # Убираем ведущую @ если есть
-    username = raw_username.lstrip('@')
-
+    raw_identifier = parts[0]
     try:
         amount = int(parts[1])
     except ValueError:
@@ -1275,20 +1271,27 @@ async def process_admin_bonus_add_user(message, text, context):
         context.user_data.pop('state', None)
         return True
 
+    user = None
     async for session in get_session():
-        # Ищем пользователя по username
-        stmt = select(User).where(User.username == username)
-        result = await session.execute(stmt)
-        user = result.scalar_one_or_none()
+        # Пробуем найти по username (если начинается с @ или содержит буквы)
+        if raw_identifier.startswith('@') or not raw_identifier.isdigit():
+            username = raw_identifier.lstrip('@')
+            stmt = select(User).where(User.username == username)
+            result = await session.execute(stmt)
+            user = result.scalar_one_or_none()
+        # Если не найден или идентификатор состоит только из цифр — ищем по user_id
+        if user is None and raw_identifier.isdigit():
+            user_id = int(raw_identifier)
+            user = await session.get(User, user_id)
 
         if not user:
             await edit_or_send(context, message.chat_id,
-                               f"❌ Пользователь @{username} не найден.",
+                               f"❌ Пользователь '{raw_identifier}' не найден.",
                                reply_markup=kb_admin_menu())
             context.user_data.pop('state', None)
             return True
 
-        user.bonus_balance = (user.bonus_balance or 0) + amount
+        user.bonus_balance_tg = (user.bonus_balance_tg or 0) + amount
         await session.commit()
 
         # Уведомление пользователю
@@ -1297,16 +1300,16 @@ async def process_admin_bonus_add_user(message, text, context):
                 chat_id=user.id,
                 text=f"🎉 **Вам начислено {amount} бонусов!**\n\n"
                      f"Теперь вы можете оплатить до 20% стоимости любого заказа.\n"
-                     f"💰 Ваш баланс: {user.bonus_balance} бонусов.\n\n"
+                     f"💰 Ваш баланс: {user.bonus_balance_tg} бонусов.\n\n"
                      f"Просто оформите заказ — бот предложит списать бонусы автоматически.",
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception as e:
-            logger.warning(f"Не удалось уведомить @{username}: {e}")
+            logger.warning(f"Не удалось уведомить пользователя: {e}")
 
     await edit_or_send(context, message.chat_id,
-                       f"✅ Пользователю @{username} начислено {amount} бонусов.\n"
-                       f"💰 Новый баланс: {user.bonus_balance} бонусов.",
+                       f"✅ Пользователю начислено {amount} бонусов.\n"
+                       f"💰 Новый баланс: {user.bonus_balance_tg} бонусов.",
                        reply_markup=kb_admin_menu())
     context.user_data.pop('state', None)
     return True
@@ -1327,14 +1330,14 @@ async def process_admin_bonus_add_all(message, text, context):
         count = 0
         for user in users:
             if user.id != ADMIN_USER_ID:
-                user.bonus_balance = (user.bonus_balance or 0) + amount
+                user.bonus_balance_tg = (user.bonus_balance_tg or 0) + amount
                 count += 1
                 try:
                     await context.bot.send_message(
                         chat_id=user.id,
                         text=f"🎉 **Вам начислено {amount} бонусов!**\n\n"
                              f"Теперь вы можете оплатить до 20% стоимости любого заказа.\n"
-                             f"💰 Ваш баланс: {user.bonus_balance} бонусов.\n\n"
+                             f"💰 Ваш баланс: {user.bonus_balance_tg} бонусов.\n\n"
                              f"Просто оформите заказ — бот предложит списать бонусы автоматически.",
                         parse_mode=ParseMode.MARKDOWN
                     )
@@ -1457,7 +1460,7 @@ async def handle_delivery_choice(update: Update, context: ContextTypes.DEFAULT_T
                                    reply_markup=kb_back_to_menu())
 
 async def process_client_promo(message, text, context):
-    """Активация промокода клиентом."""
+    """Активация промокода клиентом (TG-бот)."""
     code = text.strip().upper()
     user_id = message.from_user.id
     is_admin = (user_id == ADMIN_USER_ID)
@@ -1474,10 +1477,17 @@ async def process_client_promo(message, text, context):
             context.user_data.pop('state', None)
             return True
 
+        # Проверка платформы: TG‑промокод или универсальный
+        if promo.platform is not None and promo.platform != 'TG':
+            await edit_or_send(context, message.chat_id,
+                               "❌ Этот промокод предназначен для другого мессенджера.",
+                               reply_markup=kb_main_menu(is_admin=is_admin))
+            context.user_data.pop('state', None)
+            return True
+
         # Проверка срока действия
         if promo.expires_at:
-            expires_dt = promo.expires_at.replace(
-                tzinfo=timezone.utc) if promo.expires_at.tzinfo is None else promo.expires_at
+            expires_dt = promo.expires_at.replace(tzinfo=timezone.utc) if promo.expires_at.tzinfo is None else promo.expires_at
             if datetime.now(timezone.utc) > expires_dt:
                 await edit_or_send(context, message.chat_id,
                                    "❌ Срок действия промокода истёк.",
@@ -1508,15 +1518,15 @@ async def process_client_promo(message, text, context):
 
         user = await session.get(User, user_id)
         if not user:
-            user = User(id=user_id, bonus_balance=0)
+            user = User(id=user_id, bonus_balance_tg=0)
             session.add(user)
-        user.bonus_balance = (user.bonus_balance or 0) + promo.bonus_amount
+        user.bonus_balance_tg = (user.bonus_balance_tg or 0) + promo.bonus_amount
         promo.used_count += 1
 
         session.add(PromoUsage(promo_code=code, user_id=user_id))
         await session.commit()
 
-        new_balance = user.bonus_balance
+        new_balance = user.bonus_balance_tg
 
     context.user_data.pop('main_msg_id', None)
     await edit_or_send(context, message.chat_id,

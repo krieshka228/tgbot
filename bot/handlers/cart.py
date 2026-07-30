@@ -255,9 +255,8 @@ async def cart_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def process_checkout_with_bonus(query, context, order_id: int, user_id: int, bonus_amount: int):
-    """Оформление заказа с учётом бонусов."""
+    """Оформление заказа с учётом бонусов (TG-бот)."""
     try:
-        # 1. Получаем QR-код
         qr_telegram = None
         async for session in get_session():
             qr_telegram = await get_bot_setting(session, "payment_qr_telegram")
@@ -270,7 +269,6 @@ async def process_checkout_with_bonus(query, context, order_id: int, user_id: in
             )
             return
 
-        # 2. Обработка заказа
         async for session in get_session():
             stmt = (
                 select(Order)
@@ -286,23 +284,21 @@ async def process_checkout_with_bonus(query, context, order_id: int, user_id: in
                 return
 
             if order.status != OrderStatus.draft:
-                # ... обработка статусов ...
+                # статус уже изменён
                 return
 
-            # 3. Списываем бонусы
+            # Списываем бонусы с TG-баланса
             user = await session.get(User, user_id)
             if user and bonus_amount > 0:
-                user.bonus_balance = (user.bonus_balance or 0) - bonus_amount
+                user.bonus_balance_tg = (user.bonus_balance_tg or 0) - bonus_amount
                 order.total_amount -= bonus_amount
-                order.bonus_used = bonus_amount  # добавить поле в Order
+                order.bonus_used = bonus_amount
 
-            # 4. Остальная логика (списание товаров, статус)
             order.status = OrderStatus.pending
             await session.commit()
             invalidate_catalog_cache()
             cart_text = format_cart(order)
 
-        # 5. Отправка сообщения с заказом и бонусами
         bonus_text = f"\n💎 Списано бонусов: {bonus_amount}" if bonus_amount > 0 else ""
         text = (
             f"✅ **Заказ #{order.id} оформлен!**\n\n"
@@ -343,7 +339,7 @@ async def process_checkout_with_bonus(query, context, order_id: int, user_id: in
 
 
 async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Финальное подтверждение заказа с атомарным резервированием и показом QR-кода."""
+    """Финальное подтверждение заказа с атомарным резервированием и показом QR-кода (TG-бот)."""
     query = update.callback_query
     await query.answer()
 
@@ -351,13 +347,13 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     try:
-        # ✅ 1. ПРОВЕРКА БОНУСОВ
+        # 1. Проверка бонусов (используем TG-баланс)
         bonus_balance = 0
         order_total = 0
         async for session in get_session():
             user = await session.get(User, user_id)
             if user:
-                bonus_balance = user.bonus_balance or 0
+                bonus_balance = user.bonus_balance_tg or 0
 
             order = await get_draft_order(session, user_id)
             if order:
@@ -370,7 +366,7 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['state'] = 'order_bonus_input'
             context.user_data['data'] = {
                 'order_id': order_id,
-                'bonus_balance': bonus_balance,
+                'bonus_balance': bonus_balance,      # в process_order_bonus_input используется это имя
                 'order_total': order_total,
             }
             max_bonus = min(bonus_balance, int(order_total * 0.2))
@@ -383,7 +379,7 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # 2. Получаем Telegram file_id QR-кода (если бонусов нет или их не используют)
+        # 2. Получаем QR-код
         qr_telegram = None
         for attempt in range(3):
             try:
@@ -433,20 +429,19 @@ async def checkout_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 return
 
-            # 4. Проверяем остатки (если используется логика остатков)
+            # Проверка остатков (оставим без изменений, но stock не используется)
             product_ids = [item.product_id for item in order.items]
             if product_ids:
                 lock_products = select(Product).where(Product.id.in_(product_ids)).with_for_update()
                 locked = (await session.execute(lock_products)).scalars().all()
                 product_map = {p.id: p for p in locked}
 
-            # 5. Меняем статус на pending
             order.status = OrderStatus.pending
             await session.commit()
             invalidate_catalog_cache()
             cart_text = format_cart(order)
 
-        # 6. Отправка фото с QR
+        # 4. Отправка фото с QR
         text = (
             f"✅ **Заказ #{order.id} оформлен!**\n\n"
             f"{cart_text}\n\n"

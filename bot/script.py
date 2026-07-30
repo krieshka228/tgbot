@@ -1,17 +1,43 @@
+"""
+clean_db.py — очистка тестовых данных из базы (без удаления товаров).
+Запускать при выключенных ботах.
+"""
+
 import asyncio
-from telegram import Bot
+from sqlalchemy import text
+from bot.db import engine, init_db
 
-BOT_TOKEN = "8589835456:AAG2L4-DY8r2GLGARfT99cm1RWnkjAwb4AQ"
-SUSPECTED_ID = -1003990354141  # попробуем с минусом
+async def clean():
+    # Инициализируем схему (на случай, если таблиц ещё нет)
+    await init_db()
 
-async def check():
-    bot = Bot(BOT_TOKEN)
-    try:
-        chat = await bot.get_chat(SUSPECTED_ID)
-        print(f"Название: {chat.title}")
-        print(f"ID: {chat.id}")
-        print(f"Тип: {chat.type}")
-    except Exception as e:
-        print(f"Ошибка: {e}")
+    async with engine.begin() as conn:
+        print("Удаляю тестовые заказы и позиции...")
+        await conn.execute(text("DELETE FROM order_items"))
+        await conn.execute(text("DELETE FROM orders"))
 
-asyncio.run(check())
+        print("Удаляю комментарии...")
+        await conn.execute(text("DELETE FROM comments"))
+
+        print("Удаляю ожидающие заказы...")
+        await conn.execute(text("DELETE FROM pending_orders"))
+
+        print("Удаляю историю использования промокодов...")
+        await conn.execute(text("DELETE FROM promo_usages"))
+
+        print("Удаляю промокоды...")
+        await conn.execute(text("DELETE FROM promo_codes"))
+
+        print("Обнуляю бонусные балансы...")
+        await conn.execute(text(
+            "UPDATE users SET bonus_balance = 0, bonus_balance_tg = 0, bonus_balance_max = 0"
+        ))
+
+        # Если нужно удалить всех пользователей, кроме админа (замените ID на свой):
+        # print("Удаляю пользователей (кроме админа)...")
+        # await conn.execute(text("DELETE FROM users WHERE id != 504486622"))
+
+        print("Готово. База очищена, товары и настройки сохранены.")
+
+if __name__ == "__main__":
+    asyncio.run(clean())

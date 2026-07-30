@@ -165,7 +165,7 @@ async def admin_bonus_check_do(update: Update, context: ContextTypes.DEFAULT_TYP
             context.user_data.pop('state', None)
             return
 
-        bonus = user.bonus_balance or 0
+        bonus = user.bonus_balance_tg or 0
         name = user.full_name or f"@{user.username}" or f"ID {user.id}"
         text = f"💎 Баланс пользователя <b>{escape_html(name)}</b>: <b>{bonus} бонусов</b>"
 
