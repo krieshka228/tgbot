@@ -1,14 +1,24 @@
 """
 main.py — точка входа Telegram-бота.
 Настройка логирования, инициализация БД, регистрация обработчиков, запуск поллинга.
+Поддержка прокси (TG_PROXY) для обхода блокировок.
 """
 
 import asyncio
 import logging
+import os
 from datetime import time
 
 import pytz
-from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+from telegram.request import HTTPXRequest
 
 # Настройки и БД
 from bot.config import settings, ADMIN_USER_ID, CHANNEL_ID
@@ -61,21 +71,42 @@ async def post_shutdown(app: Application) -> None:
     logger.info("database engine disposed", extra={"event": "shutdown"})
 
 
-async def _daily_reminder(context) -> None:
+async def _daily_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_reminders(context.bot)
 
 
 def build_application() -> Application:
     """Собирает и конфигурирует приложение (без запуска)."""
+
+    # --- Настройка прокси (если задан TG_PROXY) ---
+    proxy_url = os.getenv("TG_PROXY")
+    request = None
+    if proxy_url:
+        try:
+            # Пытаемся создать request с прокси и таймаутами
+            request = HTTPXRequest(
+                proxy=proxy_url,
+                connect_timeout=60.0,
+                read_timeout=60.0,
+                write_timeout=60.0,
+                pool_timeout=60.0,
+            )
+        except TypeError:
+            # Если старый синтаксис, пробуем без дополнительных параметров
+            try:
+                request = HTTPXRequest(proxy=proxy_url)
+            except TypeError:
+                # Если и так не работает, используем proxy_url (старая версия)
+                request = HTTPXRequest(proxy_url=proxy_url)
+        logger.info("Using proxy for Telegram API", extra={"proxy": proxy_url})
+    else:
+        logger.info("No proxy configured – direct connection to Telegram API")
+
     app = (
         Application.builder()
         .token(settings.bot_token)
+        .request(request)                     # ← передаём request (если None, то без прокси)
         .concurrent_updates(256)
-        .connection_pool_size(512)
-        .pool_timeout(30.0)
-        .connect_timeout(15.0)
-        .read_timeout(30.0)
-        .write_timeout(30.0)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
