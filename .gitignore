@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 
 # База данных
+*.db
 orders.db
 tgbot-data/
 
