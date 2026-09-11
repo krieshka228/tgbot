@@ -376,7 +376,7 @@ async def upsert_product(
 
     if stock is None:
         stock = 0
-    is_active = (stock > 0) and in_stock
+    is_active = in_stock
 
     if product is None:
         product = Product(
