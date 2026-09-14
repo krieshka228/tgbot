@@ -14,7 +14,7 @@ from bot.excel_reports import build_monthly_report, build_clients_excel
 from bot.utils import escape_markdown
 from sqlalchemy import select
 from bot.db import User, PromoCode
-from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import ContextTypes, CallbackQueryHandler
 from bot.utils import edit_or_send
 
 ADMIN_GROUP = 1
@@ -929,8 +929,12 @@ async def manage_products_page_handler(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await query.answer()
     page = int(query.data.split(":")[-1])
-    category = context.user_data.get('admin_current_cat')
-    await show_manage_products_page(query, context, category=category, page=page)
+    # Категорию НЕ передаём: show_manage_products_page сам берёт её из
+    # context.user_data['admin_current_cat'] (и 'admin_current_sub' — подкатегорию).
+    # Раньше здесь был вызов с category=..., что давало
+    # TypeError: unexpected keyword argument 'category' на каждой кнопке
+    # пагинации «← Назад» / «Вперёд →» в управлении товарами.
+    await show_manage_products_page(query, context, page=page)
 async def show_manage_products_page(query, context, page: int = 0):
     """Показывает страницу товаров с кнопками 'Удалить' и 'Скрыть/Показать'."""
     category = context.user_data.get('admin_current_cat')
