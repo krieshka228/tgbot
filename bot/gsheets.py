@@ -64,7 +64,20 @@ async def enqueue_order(session: AsyncSession, order_id: int) -> int:
 
     Вызывается из хендлеров при переходе заказа в ``confirmed``.
     Возвращает число добавленных строк.
+
+    При неактивной интеграции (``settings.gsheets_active`` == False) ничего не
+    пишет и возвращает 0: заказ при этом оформляется штатно. Проверка стоит
+    здесь, а не только в хендлере, чтобы ни один вызывающий код не мог
+    наполнить таблицу-очередь, которую некому разбирать.
     """
+    if not settings.gsheets_active:
+        logger.info(
+            "gsheets disabled — заказ %s не добавлен в outbox",
+            order_id,
+            extra={"event": "gsheets_enqueue_skipped", "order_id": order_id},
+        )
+        return 0
+
     items = (await session.execute(
         select(OrderItem.id).where(OrderItem.order_id == order_id)
     )).scalars().all()
@@ -386,7 +399,7 @@ async def _notify_config_error_once(
 
 async def gsheets_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Периодическая джоба: номенклатура → закуп-цены в БД → outbox → лист."""
-    if not settings.gsheets_enabled:
+    if not settings.gsheets_active:
         return
     client = _get_client()
 
@@ -516,27 +529,23 @@ async def gsheets_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def register_jobs(app) -> None:
-    """Регистрирует job-джобу синхронизации, если интеграция настроена."""
-    if not settings.gsheets_enabled:
-        logger.info("gsheets disabled (no GOOGLE_SHEET_ID / credentials)",
-                    extra={"event": "gsheets_disabled"})
+    """Регистрирует job-джобу синхронизации, если интеграция активна.
+
+    Интеграция считается активной только при трёх условиях одновременно:
+    ``GSHEETS_ENABLED`` не выключен, задан ``GOOGLE_SHEET_ID`` и файл ключа
+    сервисного аккаунта реально существует на диске. Пока файла нет, джоба
+    НЕ регистрируется: раньше она падала каждые 5 минут с FileNotFoundError
+    и не приносила ничего, кроме шума в логах.
+    """
+    if not settings.gsheets_active:
+        logger.info(
+            "gsheets DISABLED: %s",
+            settings.gsheets_inactive_reason,
+            extra={"event": "gsheets_disabled",
+                   "reason": settings.gsheets_inactive_reason},
+        )
         return
 
-    # Предупреждаем о заведомо неработающей конфигурации СРАЗУ при старте,
-    # а не через 5 минут первой джобой: иначе в логе сутки виден только
-    # «sync failed» без причины. Джобу при этом оставляем включённой — она
-    # заработает сама, как только файл ключа появится в примонтированном
-    # каталоге (достаточно перезапуска контейнера, правка кода не нужна).
-    import os as _os
-
-    cred_path = settings.google_credentials_path
-    if not _os.path.isfile(cred_path):
-        logger.warning(
-            "gsheets enabled, но файл ключа сервисного аккаунта отсутствует: %s "
-            "— синхронизация будет падать, пока файл не появится",
-            cred_path,
-            extra={"event": "gsheets_missing_credentials", "path": cred_path},
-        )
     app.job_queue.run_repeating(
         gsheets_sync_job,
         interval=settings.gsheets_sync_interval_minutes * 60,
