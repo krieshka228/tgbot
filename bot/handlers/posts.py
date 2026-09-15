@@ -12,13 +12,12 @@ from telegram import (
     Update,
 )
 from telegram.ext import ContextTypes, MessageHandler, filters
-from telegram.constants import ParseMode
-from bot.config import ADMIN_CHAT_ID, CHANNEL_ID, DISCUSSION_GROUP_ID
+from bot.config import ADMIN_CHAT_ID, DISCUSSION_GROUP_ID
 from bot.db import (
     Comment, get_session, upsert_product, Product, PendingOrder, get_bot_setting,
     Order, OrderItem, get_or_create_draft, add_item_to_order
 )
-from bot.utils import parse_post_product, parse_quantity, escape_markdown, format_cart
+from bot.utils import parse_post_product, parse_quantity, format_cart
 from bot.utils import upload_photo_to_max, upload_video_to_max
 
 logger = logging.getLogger(__name__)
@@ -234,18 +233,21 @@ def _resolve_post_id(message) -> str | None:
             # Это репост из канала, но без forward_origin
             # Пробуем получить message_id из репоста (может не работать)
             pass
-        # Способ 3: пробуем извлечь post_id из текста реплая (если это ссылка)
-        if reply.text:
+        # Способ 3: пробуем извлечь post_id из текста реплая (если это ссылка).
+        # getattr: у репоста/медиа-сообщения атрибута text может не быть
+        # вовсе — раньше здесь падал AttributeError и комментарий терялся.
+        reply_text = getattr(reply, "text", None) or ""
+        if reply_text:
             import re
-            match = re.search(r'/(\d+)$', reply.text)
+            match = re.search(r'/(\d+)$', reply_text)
             if match:
                 return match.group(1)
-            match = re.search(r'/post/(\d+)', reply.text)
+            match = re.search(r'/post/(\d+)', reply_text)
             if match:
                 return match.group(1)
             # Если текст реплая — это просто число (и оно похоже на post_id)
-            if reply.text.strip().isdigit():
-                return reply.text.strip()
+            if reply_text.strip().isdigit():
+                return reply_text.strip()
         # Способ 4: берём message_id реплая (как fallback)
         return str(reply.message_id)
     # Способ 5: если тред форума
@@ -292,16 +294,17 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             origin = getattr(reply, "forward_origin", None)
             if isinstance(origin, MessageOriginChannel):
                 return str(origin.message_id)
-            if reply.text:
+            reply_text = getattr(reply, "text", None) or ""
+            if reply_text:
                 import re
-                match = re.search(r'/(\d+)$', reply.text)
+                match = re.search(r'/(\d+)$', reply_text)
                 if match:
                     return match.group(1)
-                match = re.search(r'/post/(\d+)', reply.text)
+                match = re.search(r'/post/(\d+)', reply_text)
                 if match:
                     return match.group(1)
-                if reply.text.strip().isdigit():
-                    return reply.text.strip()
+                if reply_text.strip().isdigit():
+                    return reply_text.strip()
             return str(reply.message_id)
         if message.message_thread_id:
             return str(message.message_thread_id)
@@ -330,7 +333,8 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not product:
             reply = message.reply_to_message
             if reply:
-                reply_text = reply.text or reply.caption or ""
+                reply_text = (getattr(reply, "text", None)
+                              or getattr(reply, "caption", None) or "")
                 if reply_text:
                     from bot.utils import parse_post_product
                     name, article, _, _, _, _ = parse_post_product(reply_text)
@@ -352,6 +356,13 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.add(Comment(product_id=product.id, user_id=user_id, text=text))
         await session.commit()
         logger.info("comment saved", extra={"product_id": product.id})
+
+        # 3.1 Уведомляем админа. _notify_admin_comment была написана, но НИ
+        # разу не вызывалась: админ не видел ни вопросов, ни заявок из группы
+        # обсуждения (комментарий без количества просто терялся в логах).
+        # Внутри функции исключения перехватываются, поэтому на обработку
+        # комментария это влиять не может.
+        await _notify_admin_comment(context, message.from_user, product, text)
 
         # 4. Если нет количества — просто комментарий
         if qty is None:
