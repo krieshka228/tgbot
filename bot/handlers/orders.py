@@ -7,10 +7,9 @@ from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, CallbackQueryHandler
-from telegram.constants import ParseMode
 
 from bot.db import get_session, OrderStatus, Order, OrderItem, get_order_with_items, get_bot_setting
-from bot.keyboards import kb_back_to_menu, kb_payment
+from bot.keyboards import kb_back_to_menu
 from bot.utils import escape_markdown
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload

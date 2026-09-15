@@ -12,7 +12,6 @@ from sqlalchemy.orm import selectinload
 
 from bot.db import (
     get_session,
-    get_or_create_user,
     get_draft_order,
     remove_item_from_order,
     recalculate_total,
@@ -24,9 +23,8 @@ from bot.db import (
     get_bot_setting,
     invalidate_catalog_cache,
 )
-from bot.keyboards import kb_cart_actions, kb_cart_items_remove, kb_back_to_menu, kb_main_menu
-from bot.utils import format_cart, escape_markdown
-from bot.config import ADMIN_USER_ID
+from bot.keyboards import kb_cart_actions, kb_cart_items_remove, kb_back_to_menu
+from bot.utils import format_cart
 
 logger = logging.getLogger(__name__)
 

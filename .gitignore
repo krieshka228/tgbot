@@ -1,5 +1,7 @@
 # Виртуальное окружение
 .venv/
+.venv-test/
+.pytest_cache/
 ../venv/
 
 # Кэш Python
@@ -19,3 +21,5 @@ tgbot-data/
 .vscode/
 
 
+credentials.json
+secrets/

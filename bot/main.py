@@ -4,24 +4,16 @@ main.py — точка входа Telegram-бота.
 Поддержка прокси (TG_PROXY) для обхода блокировок.
 """
 
-import asyncio
 import logging
 import os
 from datetime import time
 
 import pytz
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+from telegram.ext import Application, ContextTypes
 from telegram.request import HTTPXRequest
 
 # Настройки и БД
-from bot.config import settings, ADMIN_USER_ID, CHANNEL_ID
+from bot.config import settings, CHANNEL_ID
 from bot.db import init_db, dispose_engine
 from bot.logging_config import setup_logging
 
@@ -41,7 +33,6 @@ from bot.handlers import (
 )
 from bot.error_handler import error_handler
 from bot.reminders import send_reminders
-from bot.utils import logger
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +119,11 @@ def build_application() -> Application:
     # 3) Глобальный обработчик ошибок.
     app.add_error_handler(error_handler)
 
-    # 4) Ежедневное напоминание (в 06:00 МСК).
+    # 4) Google Sheets: периодическая синхронизация (если настроена).
+    from bot.gsheets import register_jobs
+    register_jobs(app)
+
+    # 5) Ежедневное напоминание (в 06:00 МСК).
     app.job_queue.run_daily(
         _daily_reminder,
         time=time(hour=6, minute=0, tzinfo=pytz.timezone("Europe/Moscow")),
