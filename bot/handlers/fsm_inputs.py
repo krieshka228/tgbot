@@ -2,27 +2,27 @@ import logging
 import uuid
 import asyncio
 import types
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from telegram.constants import ParseMode
-from bot.db import get_session, get_or_create_user, get_order_with_items, OrderStatus, Product, Order, OrderItem, PendingOrder, get_bot_setting, set_bot_setting
-from bot.db import get_all_active_products, invalidate_catalog_cache
 from bot.keyboards import kb_main_menu, kb_back_to_menu, kb_cart_actions, kb_admin_menu, reply_main_menu
-from bot.config import ADMIN_USER_ID, ADMIN_CHAT_ID, DISCUSSION_GROUP_ID
-from bot.utils import parse_quantity, _parse_post_link, format_cart, parse_post_product, escape_markdown
+from bot.config import ADMIN_USER_ID, ADMIN_CHAT_ID
 from bot.validators import normalize_phone, parse_positive_int, parse_non_negative_int
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from bot.db import (
     get_session, get_or_create_user, get_order_with_items, OrderStatus,
     Product, Order, OrderItem, PendingOrder, get_bot_setting, set_bot_setting,
     get_all_active_products, invalidate_catalog_cache,
-    User, get_all_users, upsert_product # <-- добавлено
+    User, get_all_users, upsert_product
 )
 from bot.handlers.cart import process_checkout_with_bonus
 from sqlalchemy import delete as sql_delete
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, MessageOriginChannel
-from bot.utils import parse_quantity, _parse_post_link, format_cart, parse_post_product, escape_markdown, upload_photo_to_max, upload_video_to_max
+from telegram import MessageOriginChannel
+from bot.utils import (
+    parse_quantity, _parse_post_link, format_cart, parse_post_product,
+    escape_markdown, upload_photo_to_max, upload_video_to_max,
+)
 from bot.handlers.admin import admin_bonus_check_do
 from bot.utils import edit_or_send, escape_html
 from bot.db import PromoCode, PromoUsage
@@ -63,12 +63,48 @@ def _resolve_post_id(message) -> str | None:
     return None
 
 async def _process_delayed_media_group(context: ContextTypes.DEFAULT_TYPE, group_id: str):
+    """Отложенная обработка альбома ручной синхронизации.
+
+    Вызывается через ``asyncio.create_task`` из роутера состояний, то есть
+    ВНЕ цепочки обработки апдейта PTB. Исключение отсюда не попадает в
+    ``error_handler``, поэтому оно перехватывается здесь: иначе товар молча
+    терялся (админ видел только удалённое сообщение и никакой ошибки), а
+    Python писал лишь «Task exception was never retrieved».
+    """
     await asyncio.sleep(MEDIA_GROUP_TIMEOUT)
     buffer = context.user_data.get('media_buffer')
     if not buffer or group_id not in buffer:
         logger.warning(f"Буфер не найден для группы {group_id}")
         return
     entry = buffer.pop(group_id)
+    chat_id = entry['chat_id']
+    try:
+        await _handle_media_group(context, group_id, entry)
+    except Exception as exc:
+        logger.error(
+            "ручная синхронизация альбома %s не удалась: %s",
+            group_id, repr(exc), exc_info=True,
+            extra={"event": "admin_sync_failed", "media_group_id": group_id},
+        )
+        # Обязательно сообщаем админу: без этого потеря товара неотличима от
+        # успешной синхронизации. Исходные сообщения НЕ удаляем — их можно
+        # переслать повторно.
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "❌ Не удалось добавить товар из альбома. "
+                    f"Причина: {str(exc)[:200]}\n"
+                    "Сообщения сохранены — перешлите их ещё раз после исправления."
+                ),
+            )
+        except Exception:
+            logger.exception("не удалось уведомить админа о сбое синхронизации")
+
+
+async def _handle_media_group(
+    context: ContextTypes.DEFAULT_TYPE, group_id: str, entry: dict
+) -> None:
     caption = entry.get('caption', '')
     photos = entry['photos']
     videos = entry['videos']
@@ -86,7 +122,6 @@ async def _process_delayed_media_group(context: ContextTypes.DEFAULT_TYPE, group
     fake_msg.message_id = msg_ids[0] if msg_ids else 0
 
     if caption.strip():
-        # Передаём видео, но внутри process_admin_sync они не будут загружены (закомментировано)
         await process_admin_sync(fake_msg, caption, context, photos=photos, videos=videos)
         # Удаляем исходные сообщения альбома после успешного создания товара
         for mid in msg_ids:
@@ -639,8 +674,15 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
             )
         return True
 
-    name, article, price, category, description, _stock = parse_post_product(text)
-    logger.info(f"🔵 Парсинг: name={name}, article={article}, price={price}, category={category}")
+    name, article, price, category, description, stock = parse_post_product(text)
+    # Наличие/остаток берутся из текста поста так же, как в автосинхронизации
+    # канала (bot/handlers/posts.py). Раньше stock отбрасывался в _stock, а
+    # «продано» вообще не учитывалось, поэтому товар с «На складе: 5» создавался
+    # с нулевым остатком, а проданный товар публиковался как доступный.
+    sold_keywords = ["продано", "нет в наличии", "sold", "закончился", "продана", "продан"]
+    in_stock = not any(word in text.lower() for word in sold_keywords)
+    logger.info(f"🔵 Парсинг: name={name}, article={article}, price={price}, "
+                f"category={category}, stock={stock}, in_stock={in_stock}")
 
     if not name or not article:
         await context.bot.send_message(
@@ -694,17 +736,21 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
         max_photo_ids = ",".join(tokens) if tokens else None
         logger.info(f"🔵 Загружено фото в Max: {max_photo_ids}")
 
-    # --- Загрузка видео временно отключена ---
-    # max_video_ids = None
-    # if videos:
-    #     tokens = []
-    #     for file_id in videos:
-    #         token = await upload_video_to_max(file_id, context.bot)
-    #         if token:
-    #             tokens.append(token)
-    #     max_video_ids = ",".join(tokens) if tokens else None
-    #     logger.info(f"🔵 Загружено видео в Max: {max_video_ids}")
+    # Загрузка видео в Max. Была отключена, потому что upload_video_to_max
+    # падала с aiohttp.InvalidUrlClientError: uploads (подмена ClientSession у
+    # aiomax.Bot без base_url) — баг исправлен, путь возвращён к паритету с
+    # автосинхронизацией канала (bot/handlers/posts.py).
+    # Сбой загрузки не должен ронять добавление товара: upload_video_to_max
+    # сама перехватывает исключения и возвращает None.
     max_video_ids = None
+    if videos:
+        tokens = []
+        for file_id in videos:
+            token = await upload_video_to_max(file_id, context.bot)
+            if token:
+                tokens.append(token)
+        max_video_ids = ",".join(tokens) if tokens else None
+        logger.info(f"🔵 Загружено видео в Max: {max_video_ids}")
 
     # Сохраняем товар
     async for session in get_session():
@@ -716,6 +762,8 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
             max_video_ids=max_video_ids,
             article=article, category=category,
             description=description,
+            in_stock=in_stock,
+            stock=stock,
         )
         logger.info(f"🔵 Товар сохранён: id={product.id}, name={product.name}")
         logger.info(
@@ -727,13 +775,18 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
     except Exception as e:
         logger.warning(f"Не удалось удалить сообщение: {e}")
 
-    # Удаляем предыдущее сообщение о синхронизации
+    # Чистим предыдущий отчёт о синхронизации, чтобы в чате админа не
+    # копилась стена из «✅ Добавлен товар». Раньше last_sync_msg_id только
+    # читался и никогда не записывался — ветка была мёртвой и ничего не
+    # удалялось (сообщения росли при пакетной синхронизации десятков постов).
     last_msg_id = context.user_data.get('last_sync_msg_id')
     if last_msg_id:
         try:
             await context.bot.delete_message(chat_id=message.chat_id, message_id=last_msg_id)
         except Exception as e:
-            logger.warning(f"Не удалось удалить предыдущее сообщение: {e}")
+            # «message to delete not found» — нормально: админ мог удалить
+            # его сам, или истёк 48-часовой лимит Telegram на удаление.
+            logger.debug(f"Не удалось удалить предыдущее сообщение: {e}")
 
     # Отправляем результат
     if product.is_active:
@@ -741,11 +794,14 @@ async def process_admin_sync(message, text, context, photos=None, videos=None):
     else:
         status_note = f"скрыт, остаток {product.stock or 0} шт."
 
-    await context.bot.send_message(
+    report = await context.bot.send_message(
         chat_id=message.chat_id,
         text=f"✅ Добавлен товар: «{name}» ({status_note})",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")]])
     )
+    # Запоминаем id, чтобы следующая синхронизация удалила этот отчёт.
+    # message_id может отсутствовать у фейков в тестах — берём getattr'ом.
+    context.user_data['last_sync_msg_id'] = getattr(report, 'message_id', None)
 
     context.user_data['sync_count'] = context.user_data.get('sync_count', 0) + 1
     logger.info(f"🔵 process_admin_sync FINISHED for {name}")

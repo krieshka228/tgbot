@@ -479,6 +479,10 @@ async def sync_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['state'] = 'admin_sync'
     context.user_data['sync_count'] = 0
     context.user_data['sync_skipped'] = 0
+    # Отложенные альбомы прошлой сессии синхронизации не должны «выстрелить»
+    # в новой: сбрасываем буфер и id последнего отчёта.
+    context.user_data.pop('media_buffer', None)
+    context.user_data.pop('last_sync_msg_id', None)
     await safe_edit(query,
         "📥 **Ручная синхронизация**\n\n"
         "Перешлите сюда посты из канала (можно несколько подряд). Бот обработает каждый.\n"
@@ -493,6 +497,8 @@ async def sync_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     added = context.user_data.pop('sync_count', 0)
     skipped = context.user_data.pop('sync_skipped', 0)
     context.user_data.pop('state', None)
+    # Итоговое сообщение заменяет промежуточные отчёты, поэтому их чистим.
+    context.user_data.pop('last_sync_msg_id', None)
     text = "✅ Синхронизация завершена."
     if added:
         text += f"\nДобавлено товаров: {added}"
