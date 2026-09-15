@@ -29,7 +29,12 @@ import pytest
 import bot.handlers.fsm_inputs as fi
 
 
-ADMIN_ID = 7943047063
+# Берём id админа из конфигурации, а не хардкодим: без .env (например,
+# в git worktree или в CI) ADMIN_USER_ID равен значению по умолчанию, и
+# захардкоженный id превращал бы все тесты в «вызов не от админа».
+ADMIN_ID = fi.ADMIN_USER_ID
+# Заведомо другой пользователь — для проверки ветки «не админ».
+NON_ADMIN_ID = ADMIN_ID + 1
 
 
 # ------------------------------ фейки ------------------------------
@@ -337,7 +342,7 @@ async def test_sync_counter_increments(patched_sync):
 
 async def test_non_admin_is_ignored(patched_sync):
     await fi.process_admin_sync(
-        FakeMessage(TXT_PLAIN, user_id=42), TXT_PLAIN,
+        FakeMessage(TXT_PLAIN, user_id=NON_ADMIN_ID), TXT_PLAIN,
         types.SimpleNamespace(bot=FakeBot(), user_data={}),
     )
     assert patched_sync.await_count == 0
