@@ -146,8 +146,26 @@ async def test_products_page_sends_cards_and_nav(context):
     nav_kind, nav_text, _ = context.bot.sent[-1]
     assert "Найдено 2 товаров" in nav_text and "Страница 1 из 1" in nav_text
     assert "Одежда" in nav_text
-    # Сообщение-источник (список подкатегорий) удалено — дублей нет.
-    assert query.message.deleted is True
+    # Сообщение-источник НЕ удаляется: это намеренное поведение — оно
+    # редактируется/используется как якорь навигации, а дубли карточек
+    # убирает _clear_product_messages (проверяется отдельным тестом).
+    assert query.message.deleted is False
+
+
+async def test_products_page_clears_previous_cards(context):
+    """Старые карточки и навигация удаляются при переходе по страницам.
+
+    Именно это (а не удаление query.message) защищает чат от дублей.
+    """
+    context.user_data["catalog_current_cat"] = "Одежда"
+    context.user_data["catalog_product_msgs"] = [11, 12]
+    context.user_data["catalog_nav_msg_id"] = 13
+
+    await catalog.show_products_page(FakeQuery("catalog:ss:0"), context, page=0)
+
+    assert sorted(context.bot.deleted) == [11, 12, 13]
+    # Ключи перезаписаны новыми id — старые не удалятся повторно.
+    assert context.user_data["catalog_product_msgs"] != [11, 12]
 
 
 async def test_products_page_with_photo_uses_send_photo(context):

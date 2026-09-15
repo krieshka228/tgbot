@@ -13,7 +13,9 @@ from bot.utils import format_order_for_admin
 def _order(full_name=None, user_full_name="ТГ Имя"):
     user = SimpleNamespace(id=1, username=None, full_name=user_full_name,
                            phone="+79990001122", address="ул. Пушкина")
-    item = SimpleNamespace(product=SimpleNamespace(name="Платье"),
+    # article обязателен: format_order_for_admin выводит артикул в строке
+    # позиции (Product.article есть в модели, поэтому в фикстуре он тоже нужен).
+    item = SimpleNamespace(product=SimpleNamespace(name="Платье", article="A-1"),
                            product_id=1, quantity=2, price_at_order=1000.0)
     return SimpleNamespace(id=10, user=user, items=[item], full_name=full_name,
                            delivery_address="ул. Пушкина", delivery_method="СДЭК",
