@@ -320,37 +320,104 @@ async def upload_photo_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
     return None
 
 
+async def _upload_video_file_to_max(file_path: str) -> str | None:
+    """Двухшаговая загрузка ВИДЕО в Max из файла на диске.
+
+    Отличается от пути для фото порядком операций:
+
+    * для ``image`` ответ ``/uploads`` содержит только ``url``, а токен
+      приходит в ответе на загрузку файла;
+    * для ``video``/``audio`` Max отдаёт ``token`` УЖЕ в ответе ``/uploads``.
+
+    Поэтому токен из первого ответа нельзя возвращать сразу: файл всё равно
+    обязан быть отправлен на ``url``, иначе видео в Max не появится, хотя
+    токен будет выглядеть валидным. Файл отдаётся потоково (не грузим видео
+    целиком в память — на сервере 2 ГБ RAM).
+    """
+    headers = {"Authorization": settings.max_bot_token}
+    connector = aiohttp.TCPConnector(ssl=True)
+    timeout = aiohttp.ClientTimeout(total=300)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # 1. Получаем URL для загрузки и (для видео) будущий токен.
+        async with session.post(
+            f"{MAX_API_BASE}/uploads?type=video",
+            headers=headers,
+        ) as resp:
+            resp_text = await resp.text()
+            logger.info(f"Ответ /uploads (video): status={resp.status}, body={resp_text[:500]}")
+            if resp.status != 200:
+                logger.error(f"Не удалось получить URL для видео: {resp.status} {resp_text[:500]}")
+                return None
+            try:
+                data = await resp.json()
+            except Exception:
+                logger.error(f"Ответ /uploads (video) не JSON: {resp_text[:500]}")
+                return None
+            upload_url = data.get("url")
+            pending_token = data.get("token")
+            if not upload_url:
+                # Без URL грузить некуда: токен сам по себе бесполезен.
+                logger.error("Ответ /uploads (video) не содержит URL")
+                return None
+
+        # 2. Обязательно загружаем сам файл.
+        try:
+            with open(file_path, "rb") as fh:
+                form = aiohttp.FormData()
+                form.add_field("data", fh, filename="video.mp4")
+                async with session.post(upload_url, data=form) as resp:
+                    resp_text = await resp.text()
+                    logger.info(f"Загрузка видео: status={resp.status}, body={resp_text[:500]}")
+                    if resp.status != 200:
+                        logger.error(f"Ошибка загрузки видео: {resp.status} {resp_text[:500]}")
+                        return None
+                    if pending_token:
+                        return pending_token
+                    try:
+                        result = await resp.json()
+                    except Exception:
+                        result = {}
+                    token = result.get("token")
+                    if token:
+                        return token
+                    logger.error(f"Не удалось извлечь токен видео из ответа: {resp_text[:500]}")
+                    return None
+        except Exception as e:
+            logger.error(f"Сбой при отправке видео в Max: {e!r}")
+            return None
+
+
 async def upload_video_to_max(file_id: str, tg_bot: TelegramBot) -> str | None:
-    """Загружает видео из Telegram в Max, возвращает валидный токен."""
+    """Загружает видео из Telegram в Max, возвращает Max-токен.
+
+    Раньше здесь использовался ``aiomax.Bot`` с вручную подменённой
+    ``ClientSession``: внутри ``aiomax`` URL относительный (``"uploads"``) и
+    резолвится через ``base_url`` сессии, а у подменённой сессии его не было.
+    Каждый вызов падал с ``aiohttp.InvalidUrlClientError: uploads``, поэтому
+    видео не попадали в Max, а товар сохранялся без ``max_video_ids``.
+    Теперь используется прямой HTTP-путь, как и для фото.
+    """
+    import tempfile
+
+    file_path = None
     try:
         file_obj = await tg_bot.get_file(file_id)
-        # Используем временный файл с уникальным именем
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
             file_path = tmp.name
         await file_obj.download_to_drive(file_path)
-
-        from aiomax import Bot as MaxBot
-        max_bot = MaxBot(settings.max_bot_token)
-
-        connector = aiohttp.TCPConnector(ssl=True)
-        max_bot.session = aiohttp.ClientSession(connector=connector)
-        max_bot.session.headers.update({'Authorization': settings.max_bot_token})
-
-        video_attachment = await max_bot.upload_video(file_path)
-        token = video_attachment.token
-        logger.info(f"Видео загружено через aiomax, токен: {token}")
-
-        await max_bot.session.close()
-        # Удаляем временный файл
-        os.unlink(file_path)
+        token = await _upload_video_file_to_max(file_path)
+        if token:
+            logger.info(f"Видео загружено в Max, токен: {token}")
         return token
     except Exception as e:
-        logger.error(f"Ошибка загрузки видео {file_id} в Max: {e}", exc_info=True)
-        # Если была создана сессия, попробуем закрыть
-        if 'max_bot' in locals() and max_bot.session:
-            await max_bot.session.close()
+        logger.warning(f"Не удалось загрузить видео {file_id} в Max: {e!r}")
         return None
+    finally:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.unlink(file_path)
+            except OSError:
+                logger.debug("не удалось удалить временный файл видео", exc_info=True)
 
 
 def _parse_post_link(text: str) -> Optional[int]:

@@ -14,7 +14,7 @@ from bot.excel_reports import build_monthly_report, build_clients_excel
 from bot.utils import escape_markdown
 from sqlalchemy import select
 from bot.db import User, PromoCode
-from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import ContextTypes, CallbackQueryHandler
 from bot.utils import edit_or_send
 
 ADMIN_GROUP = 1
@@ -479,6 +479,10 @@ async def sync_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['state'] = 'admin_sync'
     context.user_data['sync_count'] = 0
     context.user_data['sync_skipped'] = 0
+    # Отложенные альбомы прошлой сессии синхронизации не должны «выстрелить»
+    # в новой: сбрасываем буфер и id последнего отчёта.
+    context.user_data.pop('media_buffer', None)
+    context.user_data.pop('last_sync_msg_id', None)
     await safe_edit(query,
         "📥 **Ручная синхронизация**\n\n"
         "Перешлите сюда посты из канала (можно несколько подряд). Бот обработает каждый.\n"
@@ -493,6 +497,8 @@ async def sync_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     added = context.user_data.pop('sync_count', 0)
     skipped = context.user_data.pop('sync_skipped', 0)
     context.user_data.pop('state', None)
+    # Итоговое сообщение заменяет промежуточные отчёты, поэтому их чистим.
+    context.user_data.pop('last_sync_msg_id', None)
     text = "✅ Синхронизация завершена."
     if added:
         text += f"\nДобавлено товаров: {added}"
@@ -929,8 +935,12 @@ async def manage_products_page_handler(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await query.answer()
     page = int(query.data.split(":")[-1])
-    category = context.user_data.get('admin_current_cat')
-    await show_manage_products_page(query, context, category=category, page=page)
+    # Категорию НЕ передаём: show_manage_products_page сам берёт её из
+    # context.user_data['admin_current_cat'] (и 'admin_current_sub' — подкатегорию).
+    # Раньше здесь был вызов с category=..., что давало
+    # TypeError: unexpected keyword argument 'category' на каждой кнопке
+    # пагинации «← Назад» / «Вперёд →» в управлении товарами.
+    await show_manage_products_page(query, context, page=page)
 async def show_manage_products_page(query, context, page: int = 0):
     """Показывает страницу товаров с кнопками 'Удалить' и 'Скрыть/Показать'."""
     category = context.user_data.get('admin_current_cat')

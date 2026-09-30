@@ -1,12 +1,10 @@
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, filters
-from telegram.constants import ParseMode
 from bot.db import get_session, get_order_with_items, OrderStatus, invalidate_catalog_cache
 from bot.keyboards import kb_payment, kb_admin_confirm_payment, kb_main_menu, kb_back_to_menu
 from bot.config import ADMIN_USER_ID, ADMIN_CHAT_ID
-from bot.utils import format_order_for_admin, format_cart  # убрали escape_markdown
-from datetime import datetime, timedelta, timezone
+from bot.utils import format_order_for_admin
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +148,17 @@ async def admin_pay_ok(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await session.commit()
         invalidate_catalog_cache()
         client_id = order.user_id
+        # Google Sheets: ставим заказ в очередь выгрузки (идемпотентно).
+        # Пропускаем, если интеграция выключена (нет ключа сервисного
+        # аккаунта или GSHEETS_ENABLED=false) — оформление заказа от этого
+        # не зависит, enqueue_order проверит флаг и сам вернёт 0.
+        try:
+            from bot.config import settings
+            if settings.gsheets_active:
+                from bot.gsheets import enqueue_order
+                await enqueue_order(session, order.id)
+        except Exception:
+            logger.exception("gsheets enqueue failed for order %s", order.id)
 
     await context.bot.send_message(
         chat_id=client_id,

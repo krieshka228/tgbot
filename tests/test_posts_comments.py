@@ -29,9 +29,39 @@ def test_uses_channel_origin_message_id():
 
 
 def test_falls_back_to_reply_message_id_without_origin():
+    # У репоста может не быть атрибута text ВОВСЕ — раньше здесь падал
+    # AttributeError, и комментарий не обрабатывался.
     reply = SimpleNamespace(forward_origin=None, message_id=999)
     msg = SimpleNamespace(reply_to_message=reply, message_thread_id=None)
     assert _resolve_post_id(msg) == "999"
+
+
+def test_reply_without_text_attribute_does_not_crash():
+    """Регрессия: getattr вместо reply.text (медиа-репост без текста)."""
+    reply = SimpleNamespace(forward_origin=None, message_id=42)
+    assert not hasattr(reply, "text")
+    msg = SimpleNamespace(reply_to_message=reply, message_thread_id=None)
+    assert _resolve_post_id(msg) == "42"
+
+
+def test_reply_with_empty_text_falls_back():
+    reply = SimpleNamespace(forward_origin=None, message_id=7, text="")
+    msg = SimpleNamespace(reply_to_message=reply, message_thread_id=None)
+    assert _resolve_post_id(msg) == "7"
+
+
+def test_link_in_reply_text_extracts_post_id():
+    reply = SimpleNamespace(forward_origin=None, message_id=1,
+                            text="https://t.me/c/123/456")
+    msg = SimpleNamespace(reply_to_message=reply, message_thread_id=None)
+    assert _resolve_post_id(msg) == "456"
+
+
+def test_resolve_post_id_source_has_no_bare_reply_text():
+    """В модуле не осталось обращения reply.text без getattr."""
+    import inspect
+    src = inspect.getsource(_resolve_post_id)
+    assert "reply.text" not in src, "снова прямое обращение к reply.text"
 
 
 def test_uses_thread_id_when_no_reply():

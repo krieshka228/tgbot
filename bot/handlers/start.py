@@ -3,12 +3,10 @@ handlers/start.py — Команда /start, главное меню, возвр
 """
 
 import logging
-from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler
 from bot.db import get_session, get_or_create_user
-from bot.keyboards import kb_consent, kb_main_menu, kb_back_to_menu
-from bot.utils import escape_markdown
+from bot.keyboards import kb_main_menu
 from bot.config import ADMIN_USER_ID
 from bot.db import get_bot_setting, PendingOrder, Product
 from bot.handlers.catalog import clear_all_catalog_and_order_messages

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import ClassVar
 
 import logging
+import os
 import re
 
 from pydantic import Field, ValidationInfo, field_validator, model_validator
@@ -69,6 +70,61 @@ class Settings(BaseSettings):
     # Антифлуд: не более N сообщений за окно в секундах на одного пользователя.
     rate_limit_messages: int = Field(default=20, ge=1)
     rate_limit_window: float = Field(default=10.0, gt=0)
+
+    # --- Google Sheets интеграция (см. docs/gsheets_integration_design.md) ---
+    google_sheet_id: str = Field(default="", description="ID Google-таблицы (из URL /d/<ID>/edit)")
+    google_credentials_path: str = Field(
+        default="", description="Путь к credentials.json сервисного аккаунта"
+    )
+    gsheets_enabled: bool = Field(
+        default=True,
+        description="Главный выключатель интеграции: GSHEETS_ENABLED=false отключает её полностью",
+    )
+    gsheets_tab_orders: str = Field(default="Опт", description="Лист заказов из Telegram")
+    gsheets_tab_ref: str = Field(default="Справочник", description="Лист номенклатуры")
+    gsheets_sync_interval_minutes: int = Field(
+        default=5, ge=1, description="Период разбора outbox-очереди, минут"
+    )
+
+    @property
+    def gsheets_credentials_present(self) -> bool:
+        """True, если файл ключа сервисного аккаунта реально существует.
+
+        Без этого файл-ключа интеграция не может работать в принципе, а джоба
+        падала бы каждые N минут с ``FileNotFoundError`` — и молча, и в логах,
+        и в уведомлениях админу. Поэтому отсутствие файла трактуется как
+        «интеграция выключена», а не как «интеграция сломана».
+        """
+        return bool(self.google_credentials_path) and os.path.isfile(
+            self.google_credentials_path
+        )
+
+    @property
+    def gsheets_active(self) -> bool:
+        """Интеграция включена И работоспособна.
+
+        Все точки входа (джоба синхронизации, очередь заказов) должны
+        проверять именно это свойство, а не отдельные части конфигурации.
+        """
+        return bool(
+            self.gsheets_enabled
+            and self.google_sheet_id
+            and self.gsheets_credentials_present
+        )
+
+    @property
+    def gsheets_inactive_reason(self) -> str:
+        """Почему интеграция не активна — для понятной строки в логе старта."""
+        if not self.gsheets_enabled:
+            return "GSHEETS_ENABLED=false"
+        if not self.google_sheet_id:
+            return "не задан GOOGLE_SHEET_ID"
+        if not self.google_credentials_path:
+            return "не задан GOOGLE_CREDENTIALS_PATH"
+        return (
+            f"файл ключа не найден: {self.google_credentials_path} "
+            f"(интеграция включится сама после появления файла и перезапуска)"
+        )
 
     @field_validator("log_level")
     @classmethod

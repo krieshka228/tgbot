@@ -6,7 +6,6 @@ excel_reports.py — Генерация Excel-отчётов.
 """
 
 import io
-from datetime import datetime
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side

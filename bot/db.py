@@ -105,6 +105,7 @@ class Product(Base):
     max_video_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
     stock: Mapped[int | None] = mapped_column(Integer, nullable=True)
     article: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    purchase_price: Mapped[float | None] = mapped_column(Float, nullable=True)  # цена закупа (Google Sheets интеграция)
     in_stock: Mapped[bool] = mapped_column(Boolean, default=True)
     category: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -141,6 +142,25 @@ class OrderItem(Base):
     price_at_order: Mapped[float] = mapped_column(Float)
     order: Mapped["Order"] = relationship(back_populates="items")
     product: Mapped["Product"] = relationship(back_populates="items")
+
+
+class GSheetsOutbox(Base):
+    """Очередь отправки позиций заказов в Google Sheets.
+
+    Одна строка = одна позиция заказа (``OrderItem``). Уникальность по
+    ``order_item_id`` защищает от дублей при рестартах (п.7.3 проекта).
+    Джоба в ``bot/gsheets.py`` разбирает очередь раз в N минут.
+    """
+    __tablename__ = "gsheets_outbox"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(Integer, ForeignKey("orders.id"), index=True)
+    order_item_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("order_items.id"), unique=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class BotSetting(Base):
@@ -184,6 +204,8 @@ def _ensure_added_columns(conn):
         for col in ["max_photo_ids", "max_video_ids", "max_post_id"]:
             if col not in cols:
                 conn.execute(text(f"ALTER TABLE products ADD COLUMN {col} TEXT"))
+        if "purchase_price" not in cols:
+            conn.execute(text("ALTER TABLE products ADD COLUMN purchase_price FLOAT"))
     if "users" in insp.get_table_names():
         cols = {c["name"] for c in insp.get_columns("users")}
         if "platform" not in cols:
@@ -376,7 +398,7 @@ async def upsert_product(
 
     if stock is None:
         stock = 0
-    is_active = (stock > 0) and in_stock
+    is_active = in_stock
 
     if product is None:
         product = Product(

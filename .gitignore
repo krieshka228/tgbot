@@ -1,20 +1,28 @@
-# Виртуальное окружение
-.venv/
-../venv/
-
-# Кэш Python
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.venv/
+.venv-test/
 
-# База данных
+# Секреты и локальное окружение
+.env
+.env.*
+!.env.example
+secrets/
+credentials.json
+*.pem
+*.key
+
+# Базы и данные
+*.db
 orders.db
 tgbot-data/
-
-# Файл с секретами
-.env
 
 # IDE
 .idea/
 .vscode/
 
-
+# Резервные копии
+*.bak
+*.bak-*

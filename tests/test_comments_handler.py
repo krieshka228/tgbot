@@ -109,3 +109,68 @@ async def test_no_product_warns_and_skips(monkeypatch, caplog):
     assert any("no product for post_id" in r.message for r in caplog.records)
     assert bot.sent == []          # админа не уведомляем
     assert msg.deleted is False    # сообщение не трогаем
+
+
+# ------- регрессии на мёртвое уведомление админа (_notify_admin_comment) -------
+
+def test_notify_admin_comment_is_actually_called():
+    """Регрессия: функция была определена, но ни разу не вызывалась.
+
+    Проверяем по AST, а не по тексту: в комментариях упоминание допустимо.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(posts.handle_comment))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_notify_admin_comment"
+    ]
+    assert calls, "handle_comment снова не уведомляет админа о комментарии"
+
+
+async def test_admin_notified_even_for_order_comment(monkeypatch):
+    """Уведомление идёт и когда комментарий содержит количество (заявка).
+
+    Товар помечен неактивным, чтобы не уходить в ветку оформления заказа —
+    она не относится к предмету теста. Важно, что уведомление админу
+    отправляется ДО проверки количества и активности (шаг 3.1).
+    """
+    product = SimpleNamespace(id=7, name="Платье", price=1000.0, stock=5, is_active=False)
+    _patch(monkeypatch, product)
+
+    bot = FakeBot()
+    ctx = SimpleNamespace(bot=bot)
+    msg = FakeMessage("3")  # количество → заявка, а не просто комментарий
+    await posts.handle_comment(SimpleNamespace(message=msg), ctx)
+
+    assert any(999 == chat_id for chat_id, _ in bot.sent)
+    assert any("Платье" in (t or "") for _, t in bot.sent)
+
+
+async def test_notify_failure_does_not_break_comment_processing(monkeypatch):
+    """Сбой отправки уведомления не должен ронять обработку комментария."""
+    product = SimpleNamespace(id=7, name="Платье", price=1000.0, stock=5, is_active=True)
+    session_holder = {}
+
+    async def fake_session():
+        s = FakeSession(product)
+        session_holder["s"] = s
+        yield s
+
+    _patch(monkeypatch, product)
+    monkeypatch.setattr(posts, "get_session", fake_session)
+
+    class BrokenBot(FakeBot):
+        async def send_message(self, chat_id, text=None, **kw):
+            raise RuntimeError("Telegram недоступен")
+
+    bot = BrokenBot()
+    ctx = SimpleNamespace(bot=bot)
+    # Не должно выбросить исключение наружу.
+    await posts.handle_comment(SimpleNamespace(message=FakeMessage("вопрос")), ctx)
+
+    saved = [o for o in session_holder["s"].added if isinstance(o, Comment)]
+    assert saved, "комментарий не сохранён из-за сбоя уведомления"

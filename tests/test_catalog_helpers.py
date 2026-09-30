@@ -49,4 +49,31 @@ def test_product_caption_html_escapes_and_has_price():
                                     article="A-1", stock=3, description="100% хлопок"))
     assert "<b>Куртка &lt;Pro&gt;</b>" in cap
     assert "Цена: <b>5000 ₽</b>" in cap
-    assert "A-1" in cap and "На складе: 3" in cap and "100% хлопок" in cap
+    assert "A-1" in cap and "100% хлопок" in cap
+
+
+def test_product_caption_has_no_stock_line():
+    """Остаток в карточке НЕ показывается (убран намеренно).
+
+    Причина: is_active теперь равен in_stock (bdb341f), а в каталоге и так
+    показываются только товары в наличии — строка «На складе: N шт.» либо
+    дублировала это, либо пугала нулём при stock=0/in_stock=True.
+    """
+    cap = _product_caption(_product(stock=7))
+    assert "На складе" not in cap
+
+
+def test_product_caption_without_article_omits_line():
+    """Нет артикула — строки про артикул тоже нет (пустых «Артикул: —» не показываем)."""
+    cap = _product_caption(_product(article=None))
+    assert "Артикул" not in cap
+
+
+def test_product_caption_escapes_article_and_description():
+    cap = _product_caption(_product(article="A<1>", description="x & y"))
+    assert "A&lt;1&gt;" in cap
+    assert "x &amp; y" in cap
+
+
+def test_product_caption_handles_missing_name():
+    assert "<b>Без названия</b>" in _product_caption(_product(name=None))

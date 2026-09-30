@@ -22,3 +22,8 @@ __pycache__/
 Dockerfile
 .dockerignore
 README.md
+secrets/
+
+# Тестовое виртуальное окружение и кэш pytest (125 МБ мусора в образе)
+.venv-test/
+.pytest_cache/
