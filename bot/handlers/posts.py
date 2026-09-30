@@ -455,7 +455,9 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Failed to process order: {e}")
             await session.rollback()
-            # Сохраняем PendingOrder без ID сообщения, чтобы пользователь мог подтвердить через /start
+            # Сохраняем PendingOrder без ID сообщения, чтобы пользователь мог подтвердить через /start.
+            # Ключевая деталь: объект после rollback теряет загруженные атрибуты.
+            # Поэтому сначала заново загружаем запись, а затем меняем её поля.
             stmt = select(PendingOrder).where(PendingOrder.user_id == user_id)
             existing = (await session.execute(stmt)).scalar_one_or_none()
             if existing:
@@ -464,7 +466,11 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 pending = PendingOrder(user_id=user_id, product_id=product.id, quantity=qty)
                 session.add(pending)
-            await session.commit()
+            try:
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
             # Не пишем в группу, только логируем
             await message.delete()
             return
